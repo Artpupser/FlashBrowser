@@ -1,0 +1,4304 @@
+
+// ============================================================================
+// Source file: src/App.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines;
+using FlashBrowser.Core.Pipelines.Context;
+
+namespace FlashBrowser;
+
+public sealed class App(StartupPipeline startupPipeline, CorePipeline corePipeline) : IApp, IDisposable {
+   private CancellationTokenSource? _linkedCts;
+   private IPipelineContext? _startupContext;
+
+   public async Task Run(CancellationToken cancellationToken) {
+      _linkedCts = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken);
+      var contextOption = await startupPipeline.RunAsync(cancellationToken);
+      if (contextOption.Out(out _startupContext))
+         await corePipeline.Execute(_startupContext, cancellationToken);
+   }
+
+   public async Task Stop() {
+      if (_linkedCts != null)
+         await _linkedCts.CancelAsync();
+   }
+
+   public void Dispose() {
+      _linkedCts?.Dispose();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/ClearBrowserCookiesStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class ClearBrowserCookiesStrategy(IUiBuilder ui) : ICoreStrategy {
+   public string Title => "Clear cookies";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      while (cancellationToken.IsCancellationRequested == false) {
+         var openedPages = context.BrowserService.OpenedPages.Where(x => x.IsClosed == false).ToArray();
+         string[] openedPagesNames = [.. openedPages.Select(x => new Uri(x.Url).Host), "(danger) all"];
+         var siteRef = new ValueRef<(int index, string name)>();
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(openedPagesNames)
+               .WithPrompt("Select a site")
+               .Ref(siteRef)));
+
+         if (await ui.RunAndClear(cancellationToken) && siteRef.Get().index > -1) {
+            var all = siteRef.Get().index == openedPagesNames.Length - 1;
+            var verifyMessage = new ValueRef<string>(all
+               ? $"Do you want clear all cookies, from browser {context.BrowserService.ActiveBrowser.GetLowerName()}"
+               : $"Do you want clear cookies, host '{siteRef.Get().name}'");
+            var verifyRef = new ValueRef<bool>();
+            ui.WithChain(chain => chain
+               .WithVerify(verify => verify
+                  .WithPrompt(verifyMessage)
+                  .Ref(verifyRef)));
+            if (await ui.RunAndClear(cancellationToken) && verifyRef.Get()) {
+               var pages = all ? openedPages : [openedPages[siteRef.Get().index]];
+               foreach (var page in pages) {
+                  var cookies = await page.GetCookiesAsync();
+                  foreach (var cookie in cookies)
+                     await ui.Message($"Find cookie:  {cookie.Domain} {cookie.Name} {cookie.Expires}",
+                        cancellationToken);
+                  await page.DeleteCookieAsync(cookies);
+                  await ui.Message($"Removing all cookies, host '{siteRef.Get().name}'", cancellationToken);
+               }
+            }
+
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/CloseAllBrowserTabsStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class CloseAllBrowserTabsStrategy(IUiBuilder ui, BrowserService browserService) : ICoreStrategy {
+   public string Title => $"Close all pages [{browserService.OpenedPages.Count}]";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      while (cancellationToken.IsCancellationRequested == false) {
+         var acceptRef = new ValueRef<bool>();
+         ui.WithChain(chain => chain
+            .WithVerify(verify => verify
+               .WithPrompt("Close all pages?")
+               .Ref(acceptRef)));
+         if (await ui.RunAndClear(cancellationToken))
+            await browserService.CloseAllPages(p => { ui.Message($"Page '{p.Url}' closed", cancellationToken); });
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/KillBrowserStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Killers;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class KillBrowserStrategy(IUiBuilder ui, BrowserService browserService, IProcessKiller processKiller)
+   : ICoreStrategy {
+   public string Title => $"Kill all browser <{browserService.ActiveBrowser}> process";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      foreach (var killResult in processKiller.KillByPrefix(browserService.ActiveBrowser.GetLowerName())) {
+         if (killResult.IsSuccess) {
+            await ui.Message($"Kill process '{killResult.Name}', {killResult.Id}", cancellationToken);
+            continue;
+         }
+
+         await ui.Message($"Ignore killing process with name '{killResult.Name}', {killResult.Error!.Message}",
+            cancellationToken);
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/LaunchBrowserStrategy.cs
+// ============================================================================
+
+﻿using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class LaunchBrowserStrategy(IUiBuilder ui, BrowserService browserService) : ICoreStrategy {
+   public string Title => $"Launch selected browser <{browserService.ActiveBrowser}>";
+   // ui -> uiBuilder
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      if (context.BrowserService.Browser == null) {
+         var activeBrowser = context.BrowserService.ActiveBrowser;
+         try {
+            await context.BrowserService.LaunchBrowser();
+            await ui.Message(
+               $"Launch browser <{activeBrowser}>, use '{context.BrowserService.BrowserApps[activeBrowser]}'",
+               cancellationToken);
+            return Option.Ok();
+         } catch (Exception e) {
+            await ui.Message($"Failed launch browser <{activeBrowser}> exception: {e.Message}", cancellationToken);
+            return Option.Fail();
+         }
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/OpenLaunchProfileInBrowserStrategy.cs
+// ============================================================================
+
+using System.Diagnostics;
+
+using FlashBrowser.Core.Factory;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Core.ProfileStrategy;
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class OpenLaunchProfileInBrowserStrategy(
+   IUiBuilder ui,
+   IStrategyFactory<IProfileStrategy<LaunchProfile>> launchProfilesFactory) : ICoreStrategy {
+   public string Title => "Open profile";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      var strategies = launchProfilesFactory.Create();
+      var selectStrategy = strategies.First(x => x is SelectProfileStrategy);
+      var profileContext = new LaunchProfileContext(context.DataService.ApplicationData!.Profiles);
+      while (cancellationToken.IsCancellationRequested == false && profileContext.SelectedProfile == null)
+         if (await selectStrategy.Execute(profileContext, cancellationToken) == false)
+            return Option.Fail();
+
+      var selectedProfile = profileContext.SelectedProfile!;
+      if (context.BrowserService.Browser != null) {
+         for (var i = 0; i < selectedProfile.Links.Count; i++) {
+            var link = selectedProfile.Links[i];
+            try {
+               await context.BrowserService.NewPageTab(link);
+               await ui.Message($"Open link, '{link}'", cancellationToken);
+            } catch (Exception e) {
+               await ui.Message($"Failed open link, '{link}' message, {e.Message}", cancellationToken);
+            }
+         }
+
+         for (var i = 0; i < selectedProfile.AppProfiles.Count; i++) {
+            var appProfile = selectedProfile.AppProfiles[i];
+            var executePath = appProfile.GetPathOrEmpty(context.OperatingSystemService.CurrentOperatingSystem);
+            try {
+               if (string.IsNullOrWhiteSpace(executePath))
+                  throw new Exception(
+                     $"execute path for '{context.OperatingSystemService.CurrentOperatingSystem}' operating system undefined");
+               Process.Start(new ProcessStartInfo {
+                  UseShellExecute = true,
+                  FileName = executePath,
+                  WindowStyle = ProcessWindowStyle.Maximized
+               });
+               await ui.Message($"Open application, '{executePath}'", cancellationToken);
+            } catch (Exception e) {
+               await ui.Message($"Failed open application, '{executePath}' message, {e.Message}", cancellationToken);
+            }
+         }
+
+         return Option.Ok();
+      }
+
+      await ui.Message("Browser not run, launch any browser and retry", cancellationToken);
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/SelectBrowserStartegy.cs
+// ============================================================================
+
+﻿using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+using PuppeteerSharp;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class SelectBrowserStartegy(IUiBuilder ui) : ICoreStrategy {
+   public string Title => "Select browser for work";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      var loadedBrowsers = context.BrowserService.BrowserApps
+         .Select(x => (e: x.Key, name: context.BrowserService.GetNameFromEnum(x.Key))).ToArray();
+      var loadedBrowserNames = loadedBrowsers.Select(x => x.name).ToArray();
+
+      if (loadedBrowsers.Length == 1) {
+         SelectBrowser(context.BrowserService, loadedBrowsers.First().e);
+         return Option.Ok();
+      }
+
+      var selectBrowseRef = new ValueRef<(int index, string name)>();
+
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(loadedBrowserNames)
+               .WithPrompt("Select browser for work")
+               .Ref(selectBrowseRef)));
+         if (await ui.RunAndClear(cancellationToken) == false)
+            break;
+
+         SelectBrowser(context.BrowserService, loadedBrowsers[selectBrowseRef.Get().index].e);
+         return Option.Ok();
+      }
+
+      return Option.Fail();
+   }
+
+   private void SelectBrowser(BrowserService browserService, SupportedBrowser browser) {
+      browserService.SetActiveBrowser(browser);
+      ui.Message($"Active browser {browser} selected");
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/BrowserStrategy/UnlaunchBrowserStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.BrowserStrategy;
+
+public sealed class UnlaunchBrowserStrategy(IUiBuilder ui, BrowserService browserService) : ICoreStrategy {
+   public string Title =>
+      $"Deactivate browser <{browserService.ActiveBrowser}> process {browserService.Browser?.Process.Id}";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      if (context.BrowserService.Browser != null)
+         try {
+            await ui.Message($"Deactivate browser <{context.BrowserService.ActiveBrowser}>...", cancellationToken);
+            await browserService.DeactivateBrowser();
+            return Option.Ok();
+         } catch (Exception e) {
+            await ui.Message(
+               $"Failed deactivate browser <{context.BrowserService.ActiveBrowser}> exception: {e.Message}",
+               cancellationToken);
+            return Option.Fail();
+         }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Factory/AppProfileFactory.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+
+namespace FlashBrowser.Core.Factory;
+
+public class AppProfileFactory(BrowserService browserService, IEnumerable<IProfileStrategy<AppProfile>> strategies)
+   : IStrategyFactory<IProfileStrategy<AppProfile>> {
+   public IEnumerable<IProfileStrategy<AppProfile>> Create() {
+      return strategies;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Factory/BrowserCommandsFactory.cs
+// ============================================================================
+
+using FlashBrowser.Core.BrowserStrategy;
+using FlashBrowser.Services.Browser;
+
+namespace FlashBrowser.Core.Factory;
+
+public class BrowserCommandsFactory(BrowserService browserService, IEnumerable<ICoreStrategy> strategies)
+   : IStrategyFactory<ICoreStrategy> {
+   public IEnumerable<ICoreStrategy> Create() {
+      return strategies
+         .Where(x => !(x is ClearBrowserCookiesStrategy && browserService.OpenedPages.Count <= 0))
+         .Where(x => !(x is CloseAllBrowserTabsStrategy && browserService.OpenedPages.Count <= 0))
+         .Where(x => !(x is OpenLaunchProfileInBrowserStrategy && browserService.Browser == null))
+         .Where(x => !(x is LaunchBrowserStrategy && browserService.Browser != null))
+         .Where(x => !(x is UnlaunchBrowserStrategy && browserService.Browser == null))
+         .Where(x => !(x is KillBrowserStrategy && browserService.Browser != null));
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Factory/IStrategyFactory.cs
+// ============================================================================
+
+namespace FlashBrowser.Core.Factory;
+
+public interface IStrategyFactory<out T> {
+   public IEnumerable<T> Create();
+}
+
+
+// ============================================================================
+// Source file: src/Core/Factory/LaunchProfileFactory.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+
+namespace FlashBrowser.Core.Factory;
+
+public sealed class LaunchProfileFactory(
+   BrowserService browserService,
+   IEnumerable<IProfileStrategy<LaunchProfile>> strategies)
+   : IStrategyFactory<IProfileStrategy<LaunchProfile>> {
+   public IEnumerable<IProfileStrategy<LaunchProfile>> Create() {
+      return strategies;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FileSearch/FindApplicationsOfExtensionStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Os;
+
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FileSearch;
+
+public sealed class FindApplicationsOfExtensionStrategy(DefaultOsProgramFolderStrategy defaultOsProgramFolderStrategy) {
+   public string Title => "Find applications of extension";
+
+   public IEnumerable<VirtualFile> Execute(string extension, CancellationToken cancellationToken) {
+      if (cancellationToken.IsCancellationRequested)
+         yield break;
+      if (!defaultOsProgramFolderStrategy.Execute().Out(out var defaultApplicationsFolder))
+         yield break;
+      var dir = new DirectoryInfo(defaultApplicationsFolder.MyPath);
+      var enumerateOption = new EnumerationOptions {
+         MatchCasing = MatchCasing.CaseInsensitive,
+         IgnoreInaccessible = true
+      };
+      foreach (var file in dir.EnumerateFiles($"*.{extension}", enumerateOption))
+         if (file.Extension == $".{extension}" && VirtualFile.GetFile(file.FullName).Out(out var virtualFile))
+            yield return virtualFile;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FileSearch/FindApplicationsOfNameStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Os;
+
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FileSearch;
+
+public sealed class FindApplicationsOfNameStrategy(DefaultOsProgramFolderStrategy defaultOsProgramFolderStrategy) {
+   public string Title => "Find applications of name";
+
+   public IEnumerable<VirtualFile> Execute(string name, CancellationToken cancellationToken) {
+      if (cancellationToken.IsCancellationRequested)
+         yield break;
+      if (!defaultOsProgramFolderStrategy.Execute().Out(out var defaultApplicationsFolder))
+         yield break;
+      var dir = new DirectoryInfo(defaultApplicationsFolder.MyPath);
+      var enumerateOption = new EnumerationOptions {
+         MatchCasing = MatchCasing.CaseInsensitive,
+         IgnoreInaccessible = true
+      };
+
+      foreach (var file in dir.EnumerateFiles(name, enumerateOption))
+         if (file.Name.Contains(name) && VirtualFile.GetFile(file.FullName).Out(out var virtualFile))
+            yield return virtualFile;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FolderSearch/AutoSearchFromDriveStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Drive;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FolderSearch;
+
+public sealed class AutoSearchFromDriveStrategy(
+   DriveService driveService,
+   IUiBuilder ui) : IFolderSearchStrategy {
+   public string Title => $"Search through selected drive <{driveService.UsableDrive!.Name}>";
+
+   public async Task<Option<VirtualFolder>> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var usableDrive = context.DriveService.UsableDrive!;
+      var browserFolderName = new ConstValue<string>("browser_flash");
+      if (context.DriveService.FindFolderFromUsableDrive(browserFolderName.Get()).Out(out var browserFlashFolder))
+         return Option<VirtualFolder>.Ok(browserFlashFolder);
+      await ui.Message($"Folder '{browserFolderName.Get()}' undefined, in drive <{usableDrive.Name}>",
+         cancellationToken);
+      return Option<VirtualFolder>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FolderSearch/HistoryStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FolderSearch;
+
+public sealed class HistoryStrategy(string path, IUiBuilder ui) : IFolderSearchStrategy {
+   public string Title => "History";
+
+   public async Task<Option<VirtualFolder>> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var localConfig = context.DataService.ApplicationData!;
+      var history = localConfig.LastBrowserFoldersHistory;
+      if (VirtualFolder.GetFolder(path).Out(out var browserFolder)) return Option<VirtualFolder>.Ok(browserFolder);
+
+      await ui.Message($"Folder with path '{path}' undefined, in any drive", cancellationToken);
+      var acceptRef = new ValueRef<bool>();
+      ui
+         .WithChain(chain => chain
+            .WithVerify(verify => verify
+               .WithPrompt($"Remove path from history? '{path}'")
+               .Ref(acceptRef)));
+      await ui.RunAndClear(cancellationToken);
+      if (acceptRef.Get()) {
+         history.Remove(browserFolder.MyPath);
+         localConfig.LastBrowserFoldersHistory = history;
+      }
+
+      return Option<VirtualFolder>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FolderSearch/SearchFromApplicationFolder.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FolderSearch;
+
+public sealed class SearchFromApplicationFolder(IUiBuilder ui) : IFolderSearchStrategy {
+   public string Title => "Auto search from application folder";
+
+   public async Task<Option<VirtualFolder>> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      if (VirtualIo.RootFolder.GetOrCreateFolderIn("browser_flash").Out(out var browserFlashFolder))
+         return Option<VirtualFolder>.Ok(browserFlashFolder);
+
+      await ui.Message($"Folder with name 'browser_flash' undefined, in {VirtualIo.RootFolder.MyPath}",
+         cancellationToken);
+      return Option<VirtualFolder>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FolderSearch/SearchFromCustomPath.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FolderSearch;
+
+public sealed class SearchFromCustomPath(IUiBuilder ui) : IFolderSearchStrategy {
+   public string Title => "Search from custom path";
+
+   public async Task<Option<VirtualFolder>> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var folderPathRef = new ValueRef<string>();
+
+      ui
+         .WithChain(chain => chain
+            .WithInput<string>(input => input
+               .WithPrompt("Type folder path")
+               .WithRange(1, ushort.MaxValue)
+               .Ref(folderPathRef)));
+
+      if (await ui.RunAndClear(cancellationToken) == false)
+         return Option<VirtualFolder>.Fail();
+
+      if (VirtualFolder.GetFolder(folderPathRef.Get()).Out(out var browserFlashFolder))
+         return Option<VirtualFolder>.Ok(browserFlashFolder);
+
+      await ui.Message(new ConstValue<string>($"Folder with path '{folderPathRef.Get()}' undefined, in any drive"),
+         cancellationToken);
+      return Option<VirtualFolder>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FolderSearch/SearchFromDriveFolderStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Drive;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.FolderSearch;
+
+public sealed class SearchFromDriveFolderStrategy(
+   IUiBuilder ui,
+   DriveService driveService,
+   TypeFolderNameStrategy typeFolderNameStrategy)
+   : IFolderSearchStrategy {
+   public string Title => $"Search through selected drive <{driveService.UsableDrive!.Name}> with custom name";
+
+   public async Task<Option<VirtualFolder>> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var usableDrive = context.DriveService.UsableDrive!;
+      var browserFolderName = new ValueRef<string>("browser_flash");
+      var verifyValue = new ValueRef<bool>();
+
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithVerify(verify => verify
+               .WithPrompt($"Use default name? <{browserFolderName.Get()}>")
+               .Ref(verifyValue)));
+         await ui.RunAndClear(cancellationToken);
+         if (verifyValue.Get() == false) {
+            var changedFolderNameOption = await typeFolderNameStrategy.Execute(context, cancellationToken);
+            if (changedFolderNameOption.Out(out var newFolderName))
+               browserFolderName.Set(newFolderName);
+            else
+               continue;
+         }
+
+         if (context.DriveService.FindFolderFromUsableDrive(browserFolderName.Get()).Out(out var browserFlashFolder))
+            return Option<VirtualFolder>.Ok(browserFlashFolder);
+
+         await ui.Message(
+            new ConstValue<string>($"Folder '{browserFolderName.Get()}' undefined, in drive <{usableDrive.Name}>"),
+            cancellationToken);
+      }
+
+      return Option<VirtualFolder>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/FolderSearch/TypeFolderNameStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.FolderSearch;
+
+public sealed class TypeFolderNameStrategy(IUiBuilder ui) : IExecuteStrategy<IPipelineContext, Option<string>> {
+   public string Title => "Type folder name";
+
+   public async Task<Option<string>> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var browserFolderName = new ValueRef<string>();
+      ui
+         .WithChain(chain => chain
+            .WithInput<string>(input => input
+               .WithPrompt(Title)
+               .WithCustomCondition(x =>
+                  x.EndsWith('\\') == false &&
+                  x.EndsWith('/') == false &&
+                  x.StartsWith('\\') == false &&
+                  x.StartsWith('/') == false)
+               .WithRange(1, ushort.MaxValue)
+               .Ref(browserFolderName)));
+      var result = await ui.RunAndClear(cancellationToken);
+      return result.Success ? Option<string>.Ok(browserFolderName.Get()) : Option<string>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/IProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Core.ProfileStrategy.Context;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core;
+
+public interface IExecuteStrategy<in T, TResult> {
+   public string Title { get; }
+   public Task<TResult> Execute(T context, CancellationToken cancellationToken);
+}
+
+public interface IProfileStrategy<T> : IExecuteStrategy<IProfileContext<T>, Option>;
+
+public interface IPipelineStrategy : IExecuteStrategy<IPipelineContext, Option>;
+
+public interface ICoreStrategy : IPipelineStrategy;
+
+public interface IStartupStrategy : IPipelineStrategy;
+
+public interface IFolderSearchStrategy : IExecuteStrategy<IPipelineContext, Option<VirtualFolder>>;
+
+
+// ============================================================================
+// Source file: src/Core/Killers/IProcessKiller.cs
+// ============================================================================
+
+using System.Diagnostics;
+
+namespace FlashBrowser.Core.Killers;
+
+public interface IProcessKiller {
+   public IEnumerable<KillResult> KillByPrefix(string prefix);
+   public IEnumerable<KillResult> KillByContains(string name);
+   public KillResult Kill(Process process);
+}
+
+
+// ============================================================================
+// Source file: src/Core/Killers/KillResult.cs
+// ============================================================================
+
+namespace FlashBrowser.Core.Killers;
+
+public record KillResult(string Name, int Id, Exception? Error = null) {
+   public bool IsSuccess => Error != null;
+}
+
+
+// ============================================================================
+// Source file: src/Core/Killers/ProcessKiller.cs
+// ============================================================================
+
+using System.Diagnostics;
+
+namespace FlashBrowser.Core.Killers;
+
+public sealed class ProcessKiller : IProcessKiller {
+   public IEnumerable<KillResult> KillByPrefix(string prefix) {
+      foreach (var el in Process.GetProcesses()) {
+         if (el.ProcessName.StartsWith(prefix) == false)
+            continue;
+         yield return Kill(el);
+         el.Dispose();
+      }
+   }
+
+   public IEnumerable<KillResult> KillByContains(string name) {
+      foreach (var el in Process.GetProcesses()) {
+         if (el.ProcessName.Contains(name) == false)
+            continue;
+         yield return Kill(el);
+         el.Dispose();
+      }
+   }
+
+   public KillResult Kill(Process process) {
+      try {
+         process.Kill();
+         return new KillResult(process.ProcessName, process.Id);
+      } catch (Exception e) {
+         return new KillResult(process.ProcessName, process.Id, e);
+      }
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Os/DefaultOsProgramFolderStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Services.OperationSystem;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.Os;
+
+public sealed class DefaultOsProgramFolderStrategy(OperatingSystemService operatingSystemService) {
+   public Option<VirtualFolder> Execute() {
+      return operatingSystemService.CurrentOperatingSystem switch {
+         OperatingSystemType.Windows => Option<VirtualFolder>.Ok(VirtualFolder.GetFolder(@"C:\Program Files\").Content),
+         OperatingSystemType.Linux => Option<VirtualFolder>.Ok(VirtualFolder.GetFolder(@"/usr/bin/").Content),
+         OperatingSystemType.MacOs => Option<VirtualFolder>.Ok(VirtualFolder.GetFolder(@"/Applications/").Content),
+         _ => Option<VirtualFolder>.Fail()
+      };
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Os/GetOsSupportedBrowsersStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Services.OperationSystem;
+
+using PupaLib.Core;
+
+using PuppeteerSharp;
+
+namespace FlashBrowser.Core.Os;
+
+public sealed class GetOsSupportedBrowsersStrategy(OperatingSystemService operatingSystemService) {
+   public Option<IEnumerable<SupportedBrowser>> Execute() {
+      return Option<IEnumerable<SupportedBrowser>>.Ok(Get());
+   }
+
+   private IEnumerable<SupportedBrowser> Get() {
+      yield return SupportedBrowser.Firefox;
+      yield return SupportedBrowser.Chrome;
+      if (operatingSystemService.CurrentOperatingSystem != OperatingSystemType.Windows)
+         yield return SupportedBrowser.Chromium;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Pipelines/Context/IPipelineContext.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+using FlashBrowser.Services.Data;
+using FlashBrowser.Services.Drive;
+using FlashBrowser.Services.OperationSystem;
+
+namespace FlashBrowser.Core.Pipelines.Context;
+
+public interface IPipelineContext {
+   public DataService DataService { get; }
+   public DriveService DriveService { get; }
+   public BrowserService BrowserService { get; }
+   public OperatingSystemService OperatingSystemService { get; }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Pipelines/Context/PipelineContext.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+using FlashBrowser.Services.Data;
+using FlashBrowser.Services.Drive;
+using FlashBrowser.Services.OperationSystem;
+
+namespace FlashBrowser.Core.Pipelines.Context;
+
+public sealed class PipelineContext(
+   DataService dataService,
+   DriveService driveService,
+   BrowserService browserService,
+   OperatingSystemService operatingSystemService) : IPipelineContext {
+   public DataService DataService { get; set; } = dataService;
+   public DriveService DriveService { get; set; } = driveService;
+   public BrowserService BrowserService { get; set; } = browserService;
+   public OperatingSystemService OperatingSystemService { get; set; } = operatingSystemService;
+}
+
+
+// ============================================================================
+// Source file: src/Core/Pipelines/CorePipeline.cs
+// ============================================================================
+
+﻿using FlashBrowser.Core.Factory;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Pipelines;
+
+public sealed class CorePipeline(
+   IUiBuilder ui,
+   IStrategyFactory<ICoreStrategy> commandsFactory) {
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      const byte maxExitAttempts = 3;
+      var exitAttempts = maxExitAttempts;
+      while (cancellationToken.IsCancellationRequested == false) {
+         var strategiesArr = commandsFactory.Create().ToArray();
+         var strategiesNames = strategiesArr.Select(x => x.Title).ToArray();
+         var actionRef = new ValueRef<(int index, string name)>();
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(strategiesNames)
+               .WithPrompt("Select action")
+               .Ref(actionRef)));
+         if (await ui.RunAndClear(cancellationToken) && actionRef.Get().index > -1) {
+            var strategy = strategiesArr[actionRef.Get().index];
+            exitAttempts = maxExitAttempts;
+            await strategy.Execute(context, cancellationToken);
+         } else {
+            exitAttempts -= 1;
+            if (exitAttempts == 0)
+               return Option.Ok();
+            await ui.Message($"If you want exit, press ESC <{exitAttempts}/{maxExitAttempts}> once", cancellationToken);
+         }
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Pipelines/StartupPipeline.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Core.Startup.Context;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Pipelines;
+
+public sealed class StartupPipeline(IStartupContextFactory startupContextFactory, IEnumerable<IStartupStrategy> steps) {
+   public async Task<Option<IPipelineContext>> RunAsync(CancellationToken cancellationToken) {
+      var context = startupContextFactory.Create();
+      foreach (var step in steps) {
+         var result = await step.Execute(context, cancellationToken);
+         if (result == false)
+            return Option<IPipelineContext>.Fail();
+      }
+
+      return Option<IPipelineContext>.Ok(context);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/ChangeApplicationPathsProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.Services.OperationSystem;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class ChangeApplicationPathsProfileStrategy(OperatingSystemService osService, IUiBuilder ui)
+   : IProfileStrategy<AppProfile>, IChangeProfileStrategy, IRequiredProfileStrategy {
+   public string Title => "Change application paths";
+
+   public async Task<Option> Execute(IProfileContext<AppProfile> context, CancellationToken cancellationToken) {
+      var profile = context.SelectedProfile!;
+      var osRef = new ValueRef<(int index, string name)>();
+      while (cancellationToken.IsCancellationRequested == false) {
+         var osNames = osService.Select(x =>
+               $"{(x == osService.CurrentOperatingSystem ? "[current] " : string.Empty)}{x.GetLowerName()}: {profile.GetPathOrEmpty((int)x)}")
+            .ToArray();
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(osNames)
+               .WithPrompt("Select os path")
+               .Ref(osRef)));
+         if (await ui.RunAndClear(cancellationToken) && osRef.Get().index > -1) {
+            if (osRef.Get().index != (int)osService.CurrentOperatingSystem) {
+               await ui.Message(
+                  $"Selected os '{(OperatingSystemType)osRef.Get().index}', now you cannot set application path to another operating system. Your os is '{osService.CurrentOperatingSystem}'",
+                  cancellationToken);
+               continue;
+            }
+
+            var index = osRef.Get().index;
+            var pathRef = new ValueRef<string>();
+            ui.WithChain(chain => chain
+               .WithInput<string>(input => input
+                  .WithCustomCondition(Path.Exists)
+                  .WithRange()
+                  .WithPrompt("Type a app path")
+                  .Ref(pathRef)));
+
+            if (await ui.RunAndClear(cancellationToken)) profile.SetExecutePath(index, pathRef.Get());
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/ChangeProfileLinksStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class ChangeProfileLinksStrategy(IUiBuilder ui)
+   : IProfileStrategy<LaunchProfile>, IChangeProfileStrategy, IRequiredProfileStrategy {
+   public string Title => "Change web links profile";
+
+   public async Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      var webProfileRef = new ValueRef<(int index, string name)>();
+      while (cancellationToken.IsCancellationRequested == false) {
+         var webProfilesArr = context.SelectedProfile!.Links.ToArray();
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(webProfilesArr)
+               .WithChoice("New link +")
+               .WithPrompt("Select a link for change")
+               .Ref(webProfileRef)));
+
+         if (await ui.RunAndClear(cancellationToken) && webProfileRef.Get().index > -1) {
+            var index = webProfileRef.Get().index;
+            if (index == webProfilesArr.Length) {
+               var linkRef = new ValueRef<string>();
+               ui.WithChain(chain => chain
+                  .WithInput<string>(input => input
+                     .WithCustomCondition(x => Uri.TryCreate(x, UriKind.Absolute, out _))
+                     .WithRange()
+                     .WithPrompt("New link")
+                     .Ref(linkRef)));
+               if (await ui.RunAndClear(cancellationToken)) {
+                  var link = linkRef.Get();
+                  context.SelectedProfile.Links = [link, .. context.SelectedProfile.Links];
+               }
+            } else {
+               var removeVerifyRef = new ValueRef<bool>();
+               ui.WithChain(chain => chain
+                  .WithVerify(verify => verify
+                     .WithPrompt($"Remove '{context.SelectedProfile.Links[index][..20]}...' link?")
+                     .Ref(removeVerifyRef)));
+               if (await ui.RunAndClear(cancellationToken) && removeVerifyRef.Get())
+                  context.SelectedProfile.Links.RemoveAt(index);
+               ;
+            }
+
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/ChangeProfileNameStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class ChangeProfileNameStrategy(
+   IUiBuilder ui
+) : IProfileStrategy<LaunchProfile>, IProfileStrategy<AppProfile>, IChangeProfileStrategy, IRequiredProfileStrategy {
+   public Task<Option> Execute(IProfileContext<AppProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => context.SelectedProfile!.Name = x, cancellationToken);
+   }
+
+   public string Title => "Change name";
+
+   public Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => context.SelectedProfile!.Name = x, cancellationToken);
+   }
+
+   private async Task<Option> Invoke<T>(IProfileContext<T> context, Action<string> setter,
+      CancellationToken cancellationToken) {
+      var inputRef = new ValueRef<string>();
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithInput<string>(input => input
+               .WithRange(3, byte.MaxValue)
+               .WithPrompt("Type a new name for context")
+               .Ref(inputRef)));
+         if (await ui.RunAndClear(cancellationToken)) {
+            setter.Invoke(inputRef.Get());
+            return Option.Ok();
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/ChangeProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class
+   ChangeProfileStrategy(
+      IUiBuilder ui,
+      IEnumerable<IChangeProfileStrategy> strategies
+   ) : IProfileStrategy<LaunchProfile>, IRequiredProfileStrategy {
+   public string Title => "Change profile";
+
+   public async Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      var changeStrategyRef = new ValueRef<(int index, string name)>();
+      var strategiesArr = strategies
+         .Select(x => x as IProfileStrategy<LaunchProfile>)
+         .Where(x => x != null)
+         .ToArray();
+      var strategiesNames = strategiesArr.Select(x => x.Title).ToArray();
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(strategiesNames)
+               .WithPrompt("Select change profile method")
+               .Ref(changeStrategyRef)));
+         if (await ui.RunAndClear(cancellationToken) && changeStrategyRef.Get().index > -1) {
+            var changeStrategy = strategiesArr[changeStrategyRef.Get().index]!;
+            await changeStrategy.Execute(context, cancellationToken);
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/Context/AppProfileContext.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+
+namespace FlashBrowser.Core.ProfileStrategy.Context;
+
+public sealed class AppProfileContext(List<AppProfile> profiles)
+   : ProfileContext<AppProfile>(profiles), IProfileContext<AppProfile>;
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/Context/IProfileContext.cs
+// ============================================================================
+
+namespace FlashBrowser.Core.ProfileStrategy.Context;
+
+public interface IProfileContext<T> {
+   public List<T> Profiles { get; }
+   public bool IsEmpty => Profiles.Count <= 0;
+   public T? SelectedProfile { get; set; }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/Context/LaunchProfileContext.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+
+namespace FlashBrowser.Core.ProfileStrategy.Context;
+
+public sealed class LaunchProfileContext(List<LaunchProfile> profiles)
+   : ProfileContext<LaunchProfile>(profiles), IProfileContext<LaunchProfile>;
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/Context/ProfileContext.cs
+// ============================================================================
+
+namespace FlashBrowser.Core.ProfileStrategy.Context;
+
+public abstract class ProfileContext<T>(List<T> profiles) {
+   public List<T> Profiles { get; private set; } = profiles;
+   public T? SelectedProfile { get; set; }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/CreateProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class CreateProfileStrategy(IUiBuilder ui)
+   : IProfileStrategy<LaunchProfile>, IProfileStrategy<AppProfile> {
+   public Task<Option> Execute(IProfileContext<AppProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => new AppProfile(x), cancellationToken);
+   }
+
+   public string Title => "New profile";
+
+   public Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => new LaunchProfile(x), cancellationToken);
+   }
+
+   public async Task<Option> Invoke<T>(IProfileContext<T> context, Func<string, T> getter,
+      CancellationToken cancellationToken) {
+      await ui.Message($"Create a new {(typeof(T) == typeof(AppProfile) ? "application" : string.Empty)} profile",
+         cancellationToken);
+      var profileNameRef = new ValueRef<string>();
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithInput<string>(input => input
+               .WithRange(3, byte.MaxValue)
+               .WithPrompt("Type a profile name")
+               .Ref(profileNameRef)));
+         if (await ui.RunAndClear(cancellationToken))
+            break;
+         return Option.Fail();
+      }
+
+      context.Profiles.Add(getter(profileNameRef.Get()));
+      await ui.Message($"Added a new profile with name '{profileNameRef.Get()}'", cancellationToken);
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/DeleteProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class DeleteProfileStrategy(IUiBuilder ui)
+   : IProfileStrategy<LaunchProfile>, IProfileStrategy<AppProfile>, IRequiredProfileStrategy {
+   public Task<Option> Execute(IProfileContext<AppProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => x.Name, cancellationToken);
+   }
+
+   public string Title => "Delete profile";
+
+   public Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => x.Name, cancellationToken);
+   }
+
+   private async Task<Option> Invoke<T>(IProfileContext<T> context, Func<T, string> nameGetter,
+      CancellationToken cancellationToken) {
+      if (context.SelectedProfile == null) {
+         await ui.Message("Profile not selected, retry", cancellationToken);
+         return Option.Fail();
+      }
+
+      var selectedProfile = context.SelectedProfile!;
+      while (cancellationToken.IsCancellationRequested == false) {
+         var verifyRef = new ValueRef<bool>();
+         ui.WithChain(chain => chain
+            .WithVerify(verify => verify
+               .WithPrompt($"Do you want delete '{nameGetter.Invoke(context.SelectedProfile)}'?")
+               .Ref(verifyRef)));
+         if (await ui.RunAndClear(cancellationToken) == false)
+            break;
+
+         if (verifyRef.Get()) {
+            context.Profiles.Remove(selectedProfile);
+            await ui.Message($"Profile with name '{nameGetter.Invoke(context.SelectedProfile)}' removed",
+               cancellationToken);
+            return Option.Ok();
+         }
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/EditAppProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Factory;
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class EditAppProfileStrategy(
+   IUiBuilder ui,
+   IStrategyFactory<IProfileStrategy<AppProfile>> appProfileFactory)
+   : IProfileStrategy<LaunchProfile>, IChangeProfileStrategy, IRequiredProfileStrategy {
+   public string Title => "Edit applications profile";
+
+   public async Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      var profileStrategies = appProfileFactory.Create().ToArray();
+      var profileStrategiesNames = profileStrategies.Select(x => x.Title).ToArray();
+      var profileStrategyRef = new ValueRef<(int index, string name)>();
+      var appProfileContext = new AppProfileContext(context.SelectedProfile!.AppProfiles);
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(profileStrategiesNames)
+               .WithPrompt("Select action for app profile")
+               .Ref(profileStrategyRef)));
+
+         if (await ui.RunAndClear(cancellationToken) && profileStrategyRef.Get().index > -1) {
+            var profileStrategy = profileStrategies[profileStrategyRef.Get().index];
+            if (profileStrategy is IRequiredProfileStrategy)
+               if (await profileStrategies.First(x => x is SelectProfileStrategy)
+                      .Execute(appProfileContext, cancellationToken) == false)
+                  continue;
+
+            await profileStrategy.Execute(appProfileContext, cancellationToken);
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/EditLaunchProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Factory;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class EditLaunchProfileStrategy(
+   IUiBuilder ui,
+   IStrategyFactory<IProfileStrategy<LaunchProfile>> launchProfilesFactory) : ICoreStrategy {
+   public string Title => "Edit profiles";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken = default) {
+      var profileStrategies = launchProfilesFactory.Create().Where(x => x is not IChangeProfileStrategy).ToArray();
+      var profileStrategiesNames = profileStrategies.Select(x => x.Title).ToArray();
+      var profileActionRef = new ValueRef<(int index, string name)>();
+      var profileContext = new LaunchProfileContext(context.DataService.ApplicationData!.Profiles);
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(profileStrategiesNames)
+               .WithPrompt("Select action for profile")
+               .Ref(profileActionRef)));
+         if (await ui.RunAndClear(cancellationToken) && profileActionRef.Get().index > -1) {
+            var profileStrategy = profileStrategies[profileActionRef.Get().index];
+            if (profileStrategy is IRequiredProfileStrategy)
+               if (await profileStrategies.First(x => x is SelectProfileStrategy)
+                      .Execute(profileContext, cancellationToken) == false)
+                  continue;
+
+            await profileStrategy.Execute(profileContext, cancellationToken);
+            await ApplyAndSave(context, profileContext, cancellationToken);
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+
+   private static async Task ApplyAndSave(IPipelineContext context, LaunchProfileContext launchProfileContext,
+      CancellationToken cancellationToken = default) {
+      context.DataService.ApplicationData!.Profiles = launchProfileContext.Profiles;
+      await context.DataService.Save(cancellationToken);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/IChangeProfileStrategy.cs
+// ============================================================================
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public interface IChangeProfileStrategy;
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/IRequiredProfileStrategy.cs
+// ============================================================================
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public interface IRequiredProfileStrategy;
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/SelectProfileStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class SelectProfileStrategy(IUiBuilder ui)
+   : IProfileStrategy<LaunchProfile>, IProfileStrategy<AppProfile> {
+   public Task<Option> Execute(IProfileContext<AppProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => x.Name, cancellationToken);
+   }
+
+   public string Title => "Select profile";
+
+   public Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      return Invoke(context, x => x.Name, cancellationToken);
+   }
+
+   private async Task<Option> Invoke<T>(
+      IProfileContext<T> context,
+      Func<T, string> nameFunc,
+      CancellationToken cancellationToken = default!) {
+      if (context.IsEmpty) {
+         await ui.Message("Profiles is empty, please create a new profile", cancellationToken);
+         return Option.Fail();
+      }
+
+      var profilesArr = context.Profiles.ToArray();
+      var profilesNamesArr = context.Profiles.Select(nameFunc).ToArray();
+      var selectProfileRef = new ValueRef<(int index, string name)>();
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(profilesNamesArr)
+               .WithPrompt("Select profile")
+               .Ref(selectProfileRef)));
+         if (await ui.RunAndClear(cancellationToken) && selectProfileRef.Get().index > -1)
+            break;
+         return Option.Fail();
+      }
+
+      context.SelectedProfile = profilesArr[selectProfileRef.Get().index];
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/ProfileStrategy/ViewProfilesStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.ProfileStrategy.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.Services.OperationSystem;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.ProfileStrategy;
+
+public sealed class ViewProfilesStrategy(OperatingSystemService osService, IUiBuilder ui)
+   : IProfileStrategy<LaunchProfile>, IProfileStrategy<AppProfile> {
+   public async Task<Option> Execute(IProfileContext<AppProfile> context, CancellationToken cancellationToken) {
+      if (context.IsEmpty) {
+         await ui.Message("Profiles is empty, please create a new application profile", cancellationToken);
+         return Option.Fail();
+      }
+
+      await ui.Message("List applications", cancellationToken);
+      foreach (var profile in context.Profiles) {
+         await ui.Message($"<< [{profile.Name}] >>", cancellationToken);
+         foreach (var osType in osService)
+            await ui.Message($"\t\t{osType.GetLowerName()}: {profile.ExecutePaths[(int)osType]}", cancellationToken);
+      }
+
+      return Option.Ok();
+   }
+
+   public string Title => "View info";
+
+   public async Task<Option> Execute(IProfileContext<LaunchProfile> context, CancellationToken cancellationToken) {
+      if (context.IsEmpty) {
+         await ui.Message("Profiles is empty, please create a new profile", cancellationToken);
+         return Option.Fail();
+      }
+
+      await ui.Message("List launch profiles", cancellationToken);
+      foreach (var profile in context.Profiles) {
+         await ui.Message($"<< [{profile.Name}] >>", cancellationToken);
+         if (profile.Links.Count <= 0)
+            await ui.Message("\tLinks not found", cancellationToken);
+         else
+            foreach (var link in profile.Links)
+               await ui.Message($"\t{link}", cancellationToken);
+
+         if (profile.AppProfiles.Count <= 0)
+            await ui.Message("\tApplications not found", cancellationToken);
+         else
+            foreach (var appProfile in profile.AppProfiles) {
+               await ui.Message($"\t{appProfile.Name} [{appProfile.ExecutePaths.Length}]", cancellationToken);
+               foreach (var osType in osService)
+                  await ui.Message($"\t\t{osType.GetLowerName()}: {appProfile.GetPathOrEmpty(osType, "undefined")}",
+                     cancellationToken);
+            }
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/Context/IStartupContextFactory.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+
+namespace FlashBrowser.Core.Startup.Context;
+
+public interface IStartupContextFactory {
+   public IPipelineContext Create();
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/Context/StartupContextFactory.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.Services.Data;
+using FlashBrowser.Services.Drive;
+using FlashBrowser.Services.OperationSystem;
+
+namespace FlashBrowser.Core.Startup.Context;
+
+public sealed class StartupContextFactory(
+   DriveService driveService,
+   DataService dataService,
+   BrowserService browserService,
+   OperatingSystemService operatingSystemService) : IStartupContextFactory {
+   public IPipelineContext Create() {
+      return new PipelineContext(dataService, driveService, browserService, operatingSystemService);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/DetectOperatingSystemStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class DetectOperatingSystemStrategy(IUiBuilder ui) : IStartupStrategy {
+   public string Title => "Detect operation system";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      context.OperatingSystemService.DetectCurrentOperatingSystem();
+      var currentOs = context.OperatingSystemService.CurrentOperatingSystem;
+
+      if (currentOs.IsNone()) {
+         await ui.Message("Your operation system, not supported", cancellationToken);
+         return Option.Fail();
+      }
+
+      await ui.Message(
+         $"Your operation system is '{currentOs.GetLowerName()}'\nplatform: {Environment.OSVersion.Platform}\nversion: {Environment.OSVersion.VersionString}",
+         cancellationToken);
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/FindBrowserApplicationsStrategy.cs
+// ============================================================================
+
+using System.Runtime.CompilerServices;
+
+using FlashBrowser.Core.FileSearch;
+using FlashBrowser.Core.Os;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+using PuppeteerSharp;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class FindBrowserApplicationsStrategy(
+   IUiBuilder ui,
+   GetOsSupportedBrowsersStrategy getOsSupportedBrowsersStrategy,
+   FindApplicationsOfNameStrategy findApplicationsOfNameStrategy) : IStartupStrategy {
+   public string Title => "Find browser application";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      await ui.Message("Search browser applications", cancellationToken);
+      var currentOs = context.OperatingSystemService.CurrentOperatingSystem;
+      while (cancellationToken.IsCancellationRequested == false &&
+             getOsSupportedBrowsersStrategy.Execute().Out(out var supportedBrowsers)) {
+         var osName = currentOs.GetLowerName();
+         await ui.Message($"Set application path for '{osName}' os", cancellationToken);
+         var arr = ApplySupportedBrowsers(context.BrowserService, supportedBrowsers, cancellationToken)
+            .ToArray();
+         if (arr.Any())
+            return Option.Ok();
+      }
+
+      await ui.Message("You not have a web browser, download any supported browser correct work this application",
+         cancellationToken);
+      return Option.Fail();
+   }
+
+   private IEnumerable<Option> ApplySupportedBrowsers(BrowserService browserService,
+      IEnumerable<SupportedBrowser> supportedBrowsers, [EnumeratorCancellation] CancellationToken cancellationToken) {
+      foreach (var supportedBrowser in supportedBrowsers) {
+         var collection = findApplicationsOfNameStrategy.Execute(supportedBrowser.GetLowerName(), cancellationToken)
+            .ToArray();
+         if (collection.Any()) yield return ApplyApp(browserService, supportedBrowser, collection.First().MyPath);
+      }
+   }
+
+   private Option ApplyApp(BrowserService browserService, SupportedBrowser browser, string path) {
+      if (browserService.SetApplication(browser, path)) {
+         ui.Message($"Apply new path <{path}> for browser '{browserService.GetNameFromEnum(browser)}'");
+         return Option.Ok();
+      }
+
+      ui.Message($"Browser '{browserService.GetNameFromEnum(browser)}' undefined with path <{path}> ");
+      return Option.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/HelloStepStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+using FlashBrowser.Utils;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class HelloStepStrategy(IUiBuilder ui) : IStartupStrategy {
+   public string Title => "Hello";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var localConfig = context.DataService.ApplicationData!;
+      var isNewPassword = localConfig.IsFirst;
+
+      await ui.Message("""
+                               __n__n__
+                        .------`-\00/-'
+                       /  ##  ## (oo)
+                       / \## __   ./
+                         |//YY \|/
+                         |||   |||
+                        
+                       """, cancellationToken);
+      while (cancellationToken.IsCancellationRequested == false && localConfig.IsFirst) {
+         await ui.Message("Hello a new user, it's FlashBrowser app", cancellationToken);
+         var newPasswordRef = new ValueRef<string>();
+         var repeatNewPasswordRef = new ValueRef<string>();
+         ui
+            .WithChain(chain => chain
+               .WithInput<string>(input => input
+                  .WithPrompt("Type a new password")
+                  .WithRange(8, 20)
+                  .Ref(newPasswordRef))
+               .WithInput<string>(input => input
+                  .WithPrompt("Repeat a new password")
+                  .WithRange(8, 20)
+                  .Ref(repeatNewPasswordRef))
+            );
+         await ui.RunAndClear(cancellationToken);
+         if (newPasswordRef.Get() == repeatNewPasswordRef.Get()) {
+            localConfig.IsFirst = false;
+            localConfig.Password = MyMath.HashSha256(newPasswordRef.Get());
+            await context.DataService.Save(cancellationToken);
+         }
+      }
+
+      const byte maxAttempts = 3;
+      var attempts = maxAttempts;
+      while (cancellationToken.IsCancellationRequested == false && localConfig.IsFirst == false &&
+             isNewPassword == false) {
+         await ui.Message("Hello user, it's FlashBrowser app", cancellationToken);
+         var passwordRef = new ValueRef<string>();
+         ui
+            .WithChain(chain => chain
+               .WithInput<string>(input => input
+                  .WithPrompt("Type a password")
+                  .WithRange(8, 20)
+                  .WithSecret('*')
+                  .Ref(passwordRef)));
+         await ui.RunAndClear(cancellationToken);
+         if (MyMath.HashSha256(passwordRef.Get()) != localConfig.Password) {
+            attempts -= 1;
+            if (attempts < 1) return Option.Fail();
+            await ui.Message($"Wrong password, attempts {attempts}/{maxAttempts}", cancellationToken);
+            continue;
+         }
+
+         break;
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/InitApplicationEnvironmentStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.Data;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class InitApplicationEnvironment(IUiBuilder ui) : IStartupStrategy {
+   private const string ApplicationEnvironmentFileName = "local.json";
+   public string Title => "Initialization application environment";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      if (VirtualIo.RootFolder.GetOrCreateFolderIn("data").Out(out var localConfigFolder)) {
+         context.DataService.ApplicationDataFolder = localConfigFolder;
+         await ui.Message($"Load or create folder '{localConfigFolder.MyPath}'",
+            cancellationToken);
+         if (localConfigFolder.GetOrCreateFileIn(ApplicationEnvironmentFileName).Out(out var localConfigFile)) {
+            context.DataService.ApplicationDataFile = localConfigFile;
+            while (cancellationToken.IsCancellationRequested == false)
+               try {
+                  if (localConfigFile.SizeInBytes <= 0) {
+                     await ui.Message($"Create and load default config '{nameof(ApplicationData)}'",
+                        cancellationToken);
+                     await context.DataService.SaveDefault(cancellationToken);
+                  }
+
+                  await ui.Message(
+                     $"Try read and parse config '{nameof(ApplicationData)}' use serializer <{context.DataService.CurrentSerializer.GetType().Name}>",
+                     cancellationToken);
+                  var result = await context.DataService.Load(cancellationToken);
+                  if (result == false)
+                     throw new Exception("Bad read file");
+                  break;
+               } catch (Exception e) {
+                  await ui.Message($"Bad read config '{nameof(ApplicationData)}' {e.Message} retry...",
+                     cancellationToken);
+               }
+         }
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/InitBrowserEnvironmentStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public class InitBrowserEnvironmentStrategy(IUiBuilder ui) : IStartupStrategy {
+   public string Title => "Initialization browser environment";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      await ui.Message("Initialization or load browser environment", cancellationToken);
+      while (cancellationToken.IsCancellationRequested == false) {
+         var bad = false;
+         context.BrowserService.ForEachSupportedBrowsers((supportedBrowser, i) => {
+            var name = context.BrowserService.GetNameFromEnum(supportedBrowser);
+            var folderOption = context.BrowserService.BrowserEnvironmentFolder.GetOrCreateFolderIn(name);
+            if (folderOption.Out(out var folder)) {
+               _ = ui.Message($"Load or create folder with name {name}, path {folder.MyPath}", cancellationToken);
+               context.BrowserService.SetFolderProfile(supportedBrowser, folder);
+               return;
+            }
+
+            bad = true;
+            _ = ui.Message($"Bad create folder with name {name}", cancellationToken);
+         });
+
+         if (bad == false)
+            break;
+
+         var retryRef = new ValueRef<bool>();
+         ui.WithChain(chain => chain
+            .WithVerify(verify => verify
+               .WithPrompt("You have bad attempts to create folder, retry?")
+               .Ref(retryRef)));
+         await ui.RunAndClear(cancellationToken);
+
+         if (retryRef.Get())
+            continue;
+         break;
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/InitKernelStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.Services.OperationSystem;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.Utils;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class InitKernelStrategy(IUiBuilder ui) : IStartupStrategy {
+   public string Title => "Initialization kernel";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      if (context.OperatingSystemService.CurrentOperatingSystem != OperatingSystemType.Windows)
+         return Option.Ok();
+      try {
+         await ui.Message("Kernel initialization", cancellationToken);
+         Kernel32Dll.EnableANSIConsoleMode();
+         await ui.Message("Enable ANSI console mode", cancellationToken);
+         return Option.Ok();
+      } catch (Exception e) {
+         await ui.Message($"Fail kernel initialization, '{e.Message}'", cancellationToken);
+         return Option.Fail();
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/SelectBrowserFolderStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.FolderSearch;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class SelectBrowserFolderStrategy(
+   IUiBuilder ui,
+   IEnumerable<IFolderSearchStrategy> folderSearchStrategies) : IStartupStrategy {
+   public string Title => "Select browser folder";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var localConfig = context.DataService.ApplicationData!;
+      var searchStrategyList = folderSearchStrategies.ToList();
+      var success = false;
+      while (cancellationToken.IsCancellationRequested == false) {
+         var choices = searchStrategyList.Select(x => x.Title).Concat(localConfig.LastBrowserFoldersHistory).ToArray();
+         var searchChoiceRef = new ValueRef<(int index, string name)>();
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(choices)
+               .WithPrompt("Search variant")
+               .Ref(searchChoiceRef)));
+
+         await ui.RunAndClear(cancellationToken);
+         var searchIndex = searchChoiceRef.Get().index;
+         var strategy = searchIndex < searchStrategyList.Count
+            ? searchStrategyList[searchIndex]
+            : new HistoryStrategy(localConfig.LastBrowserFoldersHistory[searchIndex - searchStrategyList.Count], ui);
+
+         var searchOption = await strategy.Execute(context, cancellationToken);
+         if (searchOption.Out(out var folder)) {
+            success = true;
+            context.BrowserService.BrowserEnvironmentFolder = folder;
+            Remember(context);
+         }
+
+         await context.DataService.Save(cancellationToken);
+         if (success)
+            return Option.Ok();
+      }
+
+      return Option.Fail();
+   }
+
+   private static void Remember(IPipelineContext context) {
+      var folder = context.BrowserService.BrowserEnvironmentFolder;
+      var localConfig = context.DataService.ApplicationData!;
+      var h = localConfig.LastBrowserFoldersHistory;
+      h.Remove(folder.MyPath);
+      h.Add(folder.MyPath);
+      if (h.Count > 20)
+         h.RemoveAt(0);
+      localConfig.LastBrowserFoldersHistory = h;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/SelectBrowserStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.BrowserStrategy;
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class SelectBrowserStrategy(IUiBuilder ui) : IStartupStrategy {
+   public string Title => "Select browser";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      return await new SelectBrowserStartegy(ui).Execute(context, cancellationToken);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Core/Startup/SelectDriveDeviceStrategy.cs
+// ============================================================================
+
+using FlashBrowser.Core.Pipelines.Context;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Core.Startup;
+
+public sealed class SelectDriveDeviceStrategy(IUiBuilder ui) : IStartupStrategy {
+   public string Title => "Select drive device";
+
+   public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
+      var driveManager = context.DriveService;
+      var drives = driveManager.GetActiveEjectableDrives().ToList();
+      if (drives.Any() == false) drives.AddRange(driveManager.GetActiveDrives());
+      var driveNames = drives.Select(x => x.Name).ToArray();
+      var driveChoiceRef = new ValueRef<(int index, string name)>();
+      while (cancellationToken.IsCancellationRequested == false) {
+         ui.WithChain(chain => chain
+            .WithChoice(choice => choice
+               .WithChoices(driveNames)
+               .WithPrompt("Select drive device")
+               .Ref(driveChoiceRef)));
+         if ((await ui.RunAndClear(cancellationToken)).Success) {
+            driveManager.UsableDrive = drives[driveChoiceRef.Get().index];
+            await ui.Message(
+               $"Current device is: {driveManager.UsableDrive.Name} {driveManager.UsableDrive.DriveFormat} {driveManager.UsableDrive.DriveType}",
+               cancellationToken);
+            break;
+         }
+      }
+
+      return Option.Ok();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Extensions/EnumExtensions.cs
+// ============================================================================
+
+namespace FlashBrowser.Extensions;
+
+internal static class EnumExtensions {
+   public static string GetLowerName(this Enum e) {
+      return e.ToString().ToLower();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Extensions/ExceptionExtensions.cs
+// ============================================================================
+
+namespace FlashBrowser.Extensions;
+
+internal static class ExceptionExtensions {
+   public static Exception Critical(string message) {
+      return new Exception($"[CRITICAL] {message}");
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Extensions/OperatingSystemTypeExtensions.cs
+// ============================================================================
+
+using FlashBrowser.Services.OperationSystem;
+
+namespace FlashBrowser.Extensions;
+
+internal static class OperatingSystemTypeExtensions {
+   public static bool IsWindows(this OperatingSystemType os) {
+      return os == OperatingSystemType.Windows;
+   }
+
+   public static bool IsLinux(this OperatingSystemType os) {
+      return os == OperatingSystemType.Linux;
+   }
+
+   public static bool IsMacOs(this OperatingSystemType os) {
+      return os == OperatingSystemType.MacOs;
+   }
+
+   public static bool IsNone(this OperatingSystemType os) {
+      return os == OperatingSystemType.None;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/IAnyService.cs
+// ============================================================================
+
+namespace FlashBrowser;
+
+public interface IAnyService {
+   public Task Init(CancellationToken cancellationToken);
+}
+
+
+// ============================================================================
+// Source file: src/IApp.cs
+// ============================================================================
+
+namespace FlashBrowser;
+
+public interface IApp {
+   public Task Run(CancellationToken cancellationToken);
+   public Task Stop();
+}
+
+
+// ============================================================================
+// Source file: src/IAppLifetimeManager.cs
+// ============================================================================
+
+namespace FlashBrowser;
+
+public interface IAppLifetimeManager {
+   public void Cancel();
+}
+
+
+// ============================================================================
+// Source file: src/Program.cs
+// ============================================================================
+
+﻿using FlashBrowser.Core;
+using FlashBrowser.Core.BrowserStrategy;
+using FlashBrowser.Core.Factory;
+using FlashBrowser.Core.FileSearch;
+using FlashBrowser.Core.FolderSearch;
+using FlashBrowser.Core.Killers;
+using FlashBrowser.Core.Os;
+using FlashBrowser.Core.Pipelines;
+using FlashBrowser.Core.ProfileStrategy;
+using FlashBrowser.Core.Startup;
+using FlashBrowser.Core.Startup.Context;
+using FlashBrowser.Extensions;
+using FlashBrowser.Services.Browser;
+using FlashBrowser.Services.Data;
+using FlashBrowser.Services.Drive;
+using FlashBrowser.Services.Input;
+using FlashBrowser.Services.Input.Binds;
+using FlashBrowser.Services.OperationSystem;
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Engines;
+using FlashBrowser.UI.Styles;
+using FlashBrowser.UI.Values;
+
+using Microsoft.Extensions.DependencyInjection;
+
+namespace FlashBrowser;
+
+public class Program : IAppLifetimeManager, IDisposable {
+   private static readonly CancellationTokenSource _cts = new();
+   private static ServiceProvider _provider = null!;
+   private static readonly ServiceCollection _serviceCollection = [];
+
+   public void Cancel() {
+      //Message
+      var keyboardInputService = _provider.GetRequiredService<IKeyboardInputService>();
+      var uiEngine = _provider.GetRequiredService<IUiEngine>();
+      var uiBuilder = new UiBuilder(uiEngine, keyboardInputService);
+      uiBuilder.Message(
+         new ConstValue<string>($"\n\n\nGraceful cancel, <thread {Thread.CurrentThread.ManagedThreadId}>"),
+         CancellationToken.None).Wait();
+
+      // Console reset
+      Console.ResetColor();
+      Console.CursorVisible = true;
+
+      // Cancel token
+      _cts.Cancel();
+   }
+
+   public void Dispose() {
+      _cts.Dispose();
+   }
+
+   public static async Task Main(string[] args = null!) {
+      await new Program().MainAsync(args);
+   }
+
+   public async Task MainAsync(string[] args = null!) {
+      _serviceCollection
+         //UI
+         .AddSingleton<UiTerminalEngine>()
+         .AddSingleton<IUiEngine, UiTerminalEngine>()
+         .AddSingleton<IUiBuilder, UiBuilder>()
+         //Input
+         .AddSingleton<IBindPressed, AppBinds>()
+         .AddSingleton<IKeyboardInputService, ConsoleInputService>()
+         //Services
+         .AddSingleton<IAnyService>(x => x.GetRequiredService<IKeyboardInputService>())
+
+         //Browser launch options
+         .AddTransient<IBrowserOptionsStrategy, FirefoxBrowserOptionsStrategy>()
+         .AddTransient<IBrowserOptionsStrategy, ChromeBrowserOptionsStrategy>()
+         .AddTransient<IBrowserOptionsStrategy, ChromiumBrowserOptionsStrategy>()
+         .AddSingleton<BrowserLaunchOptionsFactory>()
+
+         //Operating system
+         .AddSingleton<DefaultOsProgramFolderStrategy>()
+         .AddSingleton<GetOsSupportedBrowsersStrategy>()
+         .AddSingleton<IProcessKiller, ProcessKiller>()
+
+         //Managers
+         .AddSingleton<DriveService>()
+         .AddSingleton<DataService>()
+         .AddSingleton<BrowserService>()
+         .AddSingleton<OperatingSystemService>()
+         //Folder search strategy
+         .AddSingleton<IFolderSearchStrategy, AutoSearchFromDriveStrategy>()
+         .AddSingleton<IFolderSearchStrategy, SearchFromDriveFolderStrategy>()
+         .AddSingleton<IFolderSearchStrategy, SearchFromApplicationFolder>()
+         .AddSingleton<IFolderSearchStrategy, SearchFromCustomPath>()
+         .AddSingleton<TypeFolderNameStrategy>()
+
+         //Applications
+         .AddSingleton<DefaultOsProgramFolderStrategy>()
+         .AddSingleton<FindApplicationsOfNameStrategy>()
+
+         //Startup
+         .AddTransient<IStartupStrategy, DetectOperatingSystemStrategy>()
+         .AddTransient<IStartupStrategy, InitKernelStrategy>()
+         .AddTransient<IStartupStrategy, FindBrowserApplicationsStrategy>()
+         .AddTransient<IStartupStrategy, InitApplicationEnvironment>()
+         .AddTransient<IStartupStrategy, HelloStepStrategy>()
+         .AddTransient<IStartupStrategy, SelectDriveDeviceStrategy>()
+         .AddTransient<IStartupStrategy, SelectBrowserFolderStrategy>()
+         .AddTransient<IStartupStrategy, InitBrowserEnvironmentStrategy>()
+         .AddTransient<IStartupStrategy, SelectBrowserStrategy>()
+         .AddSingleton<IStartupContextFactory, StartupContextFactory>()
+         .AddSingleton<StartupPipeline>()
+
+         //Profile strategy
+         .AddSingleton<IProfileStrategy<LaunchProfile>, EditAppProfileStrategy>()
+         .AddSingleton<IProfileStrategy<LaunchProfile>, ChangeProfileLinksStrategy>()
+         .AddSingleton<IProfileStrategy<LaunchProfile>, ChangeProfileStrategy>()
+         .AddSingleton<IProfileStrategy<LaunchProfile>, DeleteProfileStrategy>()
+         .AddSingleton<IProfileStrategy<LaunchProfile>, CreateProfileStrategy>()
+         .AddSingleton<IProfileStrategy<AppProfile>, ChangeApplicationPathsProfileStrategy>()
+         .AddSingleton<IProfileStrategy<AppProfile>, CreateProfileStrategy>()
+         .AddSingleton<IProfileStrategy<AppProfile>, ChangeProfileNameStrategy>()
+         .AddSingleton<IProfileStrategy<AppProfile>, DeleteProfileStrategy>()
+         .AddSingleton<IProfileStrategy<AppProfile>, SelectProfileStrategy>()
+         .AddSingleton<IChangeProfileStrategy, ChangeProfileNameStrategy>()
+         .AddSingleton<IChangeProfileStrategy, EditAppProfileStrategy>()
+         .AddSingleton<IChangeProfileStrategy, ChangeProfileLinksStrategy>()
+         .AddSingleton<IProfileStrategy<LaunchProfile>, SelectProfileStrategy>()
+         .AddSingleton<IProfileStrategy<LaunchProfile>, ViewProfilesStrategy>()
+
+         //Main
+         .AddTransient<ICoreStrategy, OpenLaunchProfileInBrowserStrategy>()
+         .AddTransient<ICoreStrategy, EditLaunchProfileStrategy>()
+         .AddTransient<ICoreStrategy, SelectBrowserStartegy>()
+         .AddSingleton<ICoreStrategy, ClearBrowserCookiesStrategy>()
+         .AddTransient<ICoreStrategy, CloseAllBrowserTabsStrategy>()
+         .AddTransient<ICoreStrategy, LaunchBrowserStrategy>()
+         .AddTransient<ICoreStrategy, UnlaunchBrowserStrategy>()
+         .AddTransient<ICoreStrategy, KillBrowserStrategy>()
+         .AddSingleton<IStrategyFactory<IProfileStrategy<AppProfile>>, AppProfileFactory>()
+         .AddSingleton<IStrategyFactory<IProfileStrategy<LaunchProfile>>, LaunchProfileFactory>()
+         .AddSingleton<IStrategyFactory<ICoreStrategy>, BrowserCommandsFactory>()
+         .AddSingleton<CorePipeline>()
+
+         //App
+         .AddSingleton<IAppLifetimeManager>(this)
+         .AddSingleton<IApp, App>();
+      _provider = _serviceCollection.BuildServiceProvider(new ServiceProviderOptions {
+         ValidateScopes = true,
+         ValidateOnBuild = true
+      });
+      await InitServices(_provider, _cts.Token);
+      await ThrowIfAppIsNull(_provider).Run(_cts.Token);
+   }
+
+   private static IApp ThrowIfAppIsNull(ServiceProvider provider) {
+      var app = provider.GetService<IApp>();
+      if (app == null)
+         throw ExceptionExtensions.Critical("IApp is null");
+      return app;
+   }
+
+   private static async Task InitServices(ServiceProvider provider, CancellationToken cancellationToken = default) {
+      var services = provider.GetServices<IAnyService>().ToArray();
+      if (services.Any() == false)
+         throw ExceptionExtensions.Critical($"Services typeof <{nameof(IAnyService)}> undefined");
+      foreach (var service in services) await service.Init(cancellationToken);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Serializers/JsonNewtonsoftSerializer.cs
+// ============================================================================
+
+using System.Text;
+
+using Newtonsoft.Json;
+
+using ISerializer = PupaLib.FileIO.Serializers.ISerializer;
+
+namespace FlashBrowser.Serializers;
+
+public sealed class JsonNewtonsoftSerializer : ISerializer {
+   private static readonly JsonSerializerSettings Settings = new() {
+      NullValueHandling = NullValueHandling.Ignore,
+      Formatting = Formatting.None
+   };
+
+   public byte[] Serialize<T>(T content) where T : class {
+      var json = JsonConvert.SerializeObject(content, Settings);
+      return Encoding.UTF8.GetBytes(json);
+   }
+
+   public T Deserialize<T>(byte[] bytes) where T : class {
+      var json = Encoding.UTF8.GetString(bytes);
+      return JsonConvert.DeserializeObject<T>(json, Settings)!;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Serializers/YamlDotNetSerializer.cs
+// ============================================================================
+
+using System.Text;
+
+using YamlDotNet.Serialization;
+using YamlDotNet.Serialization.NamingConventions;
+
+using ISerializer = PupaLib.FileIO.Serializers.ISerializer;
+
+namespace FlashBrowser.Serializers;
+
+public sealed class YamlDotNetSerializer : ISerializer {
+   public byte[] Serialize<T>(T content) where T : class {
+      var serializer = new SerializerBuilder()
+         .WithNamingConvention(CamelCaseNamingConvention.Instance)
+         .Build();
+      var yaml = serializer.Serialize(content);
+      return Encoding.UTF8.GetBytes(yaml);
+   }
+
+   public T Deserialize<T>(byte[] bytes) where T : class {
+      var deserializer = new DeserializerBuilder()
+         .WithNamingConvention(CamelCaseNamingConvention.Instance)
+         .Build();
+      var yaml = Encoding.UTF8.GetString(bytes);
+      return deserializer.Deserialize<T>(yaml);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Browser/AppProfile.cs
+// ============================================================================
+
+using FlashBrowser.Services.OperationSystem;
+
+using Newtonsoft.Json;
+
+namespace FlashBrowser.Services.Browser;
+
+[Serializable]
+public sealed class AppProfile(string name) {
+   [JsonProperty] public string Name { get; set; } = name;
+   [JsonProperty] public string[] ExecutePaths { get; set; } = [];
+
+   public void SetExecutePath(int index, string path) {
+      if (ExecutePaths.Length <= index) {
+         var paths = ExecutePaths.ToList() ?? [];
+         for (var i = 0; i < index + 1; i++) paths.Add(string.Empty);
+         ExecutePaths = paths.ToArray();
+      }
+
+      ExecutePaths[index] = path;
+   }
+
+   public string GetPathOrEmpty(int index, string empty = "") {
+      var result = ExecutePaths.Length > index ? ExecutePaths[index] : string.Empty;
+      return string.IsNullOrWhiteSpace(result) ? empty : result;
+   }
+
+   public string GetPathOrEmpty(OperatingSystemType os, string empty = "") {
+      return GetPathOrEmpty((int)os, empty);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Browser/BrowserService.cs
+// ============================================================================
+
+using System.Collections.Concurrent;
+
+using FlashBrowser.Services.Data;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+using PuppeteerSharp;
+
+namespace FlashBrowser.Services.Browser;
+
+public interface IBrowserOptionsStrategy {
+   public SupportedBrowser BrowserType { get; }
+   public LaunchOptions Execute(string exePath, string profilePath);
+}
+
+public sealed class FirefoxBrowserOptionsStrategy : IBrowserOptionsStrategy {
+   public SupportedBrowser BrowserType => SupportedBrowser.Firefox;
+
+   public LaunchOptions Execute(string exePath, string profilePath) {
+      return new LaunchOptions {
+         Browser = BrowserType,
+         Headless = false,
+         HeadlessMode = HeadlessMode.False,
+         ExecutablePath = exePath,
+         Args = ["--start-debugger-server=9222", $"--profile=\"{profilePath}\""],
+         DumpIO = true
+      };
+   }
+}
+
+public sealed class ChromeBrowserOptionsStrategy : IBrowserOptionsStrategy {
+   public SupportedBrowser BrowserType => SupportedBrowser.Chrome;
+
+   public LaunchOptions Execute(string exePath, string profilePath) {
+      return new LaunchOptions {
+         Browser = BrowserType,
+         Headless = false,
+         HeadlessMode = HeadlessMode.False,
+         ExecutablePath = exePath,
+         Args = [$"--user-data-dir=\"{profilePath}\""],
+         DumpIO = false
+      };
+   }
+}
+
+public sealed class ChromiumBrowserOptionsStrategy : IBrowserOptionsStrategy {
+   public SupportedBrowser BrowserType => SupportedBrowser.Chromium;
+
+   public LaunchOptions Execute(string exePath, string profilePath) {
+      return new LaunchOptions {
+         Browser = BrowserType,
+         Headless = false,
+         HeadlessMode = HeadlessMode.False,
+         ExecutablePath = exePath,
+         Args = [$"--user-data-dir=\"{profilePath}\""],
+         DumpIO = false
+      };
+   }
+}
+
+public sealed class BrowserLaunchOptionsFactory {
+   public IBrowserOptionsStrategy Create(SupportedBrowser supportedBrowser) {
+      return supportedBrowser switch {
+         SupportedBrowser.Firefox => new FirefoxBrowserOptionsStrategy(),
+         SupportedBrowser.Chrome => new ChromeBrowserOptionsStrategy(),
+         SupportedBrowser.Chromium => new ChromiumBrowserOptionsStrategy(),
+         _ => throw new ArgumentException($"{supportedBrowser} browser otpions strategy not found.")
+      };
+   }
+}
+
+public sealed class BrowserService {
+   private readonly ConcurrentDictionary<SupportedBrowser, string> _browserApps;
+   private readonly ConcurrentDictionary<SupportedBrowser, VirtualFolder> _browserFolders;
+   private readonly BrowserLaunchOptionsFactory _browserLaunchOptionsFactory;
+   private readonly List<IPage> _openedPages;
+
+   public BrowserService(DataService dataService, BrowserLaunchOptionsFactory browserLaunchOptionsFactory) {
+      _browserFolders = new ConcurrentDictionary<SupportedBrowser, VirtualFolder>();
+      _browserApps = new ConcurrentDictionary<SupportedBrowser, string>();
+      _browserLaunchOptionsFactory = browserLaunchOptionsFactory;
+      _openedPages = [];
+      DataService = dataService;
+   }
+
+   public IReadOnlyDictionary<SupportedBrowser, VirtualFolder> BrowserFolders => _browserFolders;
+   public IReadOnlyDictionary<SupportedBrowser, string> BrowserApps => _browserApps;
+   public IReadOnlyList<IPage> OpenedPages => _openedPages;
+   public IBrowser? Browser { get; private set; }
+   public VirtualFolder BrowserEnvironmentFolder { get; set; } = null!;
+   public SupportedBrowser ActiveBrowser { get; private set; }
+
+   public DataService DataService { get; }
+
+   public async Task DeactivateBrowser() {
+      if (Browser == null)
+         return;
+      await CloseAllPages();
+      await Browser.CloseAsync();
+      Browser.Process.Kill();
+      Browser.Process.Dispose();
+      await Browser.DisposeAsync();
+      Browser = null;
+   }
+
+   public async Task LaunchBrowser() {
+      Browser = await Puppeteer.LaunchAsync(_browserLaunchOptionsFactory
+         .Create(ActiveBrowser)
+         .Execute(BrowserApps[ActiveBrowser], BrowserFolders[ActiveBrowser].MyPath));
+   }
+
+
+   public async Task CloseAllPages(Action<IPage>? closeCallback = null) {
+      if (Browser == null)
+         return;
+
+      foreach (var page in _openedPages) {
+         await page.CloseAsync();
+         closeCallback?.Invoke(page);
+         await page.DisposeAsync();
+      }
+
+      _openedPages.Clear();
+   }
+
+   public string GetNameFromEnum(SupportedBrowser supportedBrowser) {
+      return supportedBrowser.ToString().ToLower();
+   }
+
+   public void SetActiveBrowser(SupportedBrowser supportedBrowser) {
+      ActiveBrowser = supportedBrowser;
+   }
+
+   public void SetFolderProfile(SupportedBrowser supportedBrowser, VirtualFolder folder) {
+      _browserFolders[supportedBrowser] = folder;
+   }
+
+   public Option SetApplication(SupportedBrowser supportedBrowser, string path) {
+      if (File.Exists(path)) {
+         _browserApps[supportedBrowser] = path;
+         return Option.Ok();
+      }
+
+      return Option.Fail();
+   }
+
+   public async Task NewPageTab(string url) {
+      if (Browser == null)
+         return;
+      try {
+         var page = await Browser.NewPageAsync(new CreatePageOptions {
+            Type = CreatePageType.Tab,
+            WindowBounds = new WindowBounds {
+               Width = 1920,
+               Height = 1090,
+               WindowState = WindowState.Fullscreen
+            }
+         });
+         _ = page.GoToAsync(url);
+         _ = page.ResizeAsync(1920, 1080);
+         _openedPages.Add(page);
+      } catch (Exception) {
+         // ignored
+      }
+   }
+
+   public void ForEachSupportedBrowsers(Action<SupportedBrowser, int> callback) {
+      foreach (var item in _browserApps.Keys) {
+         if (OperatingSystem.IsWindows() && item == SupportedBrowser.Chromium)
+            continue;
+         callback(item, (int)item);
+      }
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Browser/LaunchProfile.cs
+// ============================================================================
+
+using Newtonsoft.Json;
+
+namespace FlashBrowser.Services.Browser;
+
+[Serializable]
+public sealed class LaunchProfile(string name) {
+   [JsonProperty] public string Name { get; set; } = name;
+   [JsonProperty] public List<string> Links { get; set; } = [];
+   [JsonProperty] public List<AppProfile> AppProfiles { get; set; } = [];
+}
+
+
+// ============================================================================
+// Source file: src/Services/Data/ApplicationData.cs
+// ============================================================================
+
+using FlashBrowser.Services.Browser;
+
+using Newtonsoft.Json;
+using Newtonsoft.Json.Linq;
+
+using PupaLib.Data;
+
+using YamlDotNet.Serialization;
+
+namespace FlashBrowser.Services.Data;
+
+[Serializable]
+public sealed class ApplicationData : RecursionData {
+   [JsonIgnore]
+   [YamlIgnore]
+   public bool IsFirst {
+      get => DeepGet<bool>("isFirst");
+      set => DeepSet("isFirst", value);
+   }
+
+   [JsonIgnore]
+   [YamlIgnore]
+   public string Password {
+      get => DeepGet<string>("password");
+      set => DeepSet<string>("password", value);
+   }
+
+   [JsonIgnore]
+   [YamlIgnore]
+   public bool DevMode {
+      get => DeepGet<bool>("devMode");
+      set => DeepSet("devMode", value);
+   }
+
+   [JsonIgnore]
+   [YamlIgnore]
+   public List<string> LastBrowserFoldersHistory {
+      get => ((JArray)Data["history"]).ToObject<List<string>>()!;
+      set => Data["history"] = JArray.FromObject(value);
+   }
+
+   [JsonIgnore]
+   [YamlIgnore]
+   public List<LaunchProfile> Profiles {
+      get => ((JArray)Data["profiles"]).ToObject<List<LaunchProfile>>()!;
+      set => Data["profiles"] = JArray.FromObject(value);
+   }
+
+   public static ApplicationData Default() {
+      var obj = new ApplicationData {
+         IsFirst = true,
+         Password = string.Empty,
+         LastBrowserFoldersHistory = [],
+         DevMode = false,
+         Profiles = []
+      };
+      return obj;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Data/DataService.cs
+// ============================================================================
+
+using FlashBrowser.Serializers;
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+using PupaLib.FileIO.Serializers;
+
+namespace FlashBrowser.Services.Data;
+
+public sealed class DataService {
+   public ApplicationData? ApplicationData { get; set; }
+   public VirtualFile? ApplicationDataFile { get; set; }
+   public VirtualFolder? ApplicationDataFolder { get; set; }
+   public ISerializer CurrentSerializer { get; } = new YamlDotNetSerializer();
+
+   public async Task Save(CancellationToken cancellationToken) {
+      if (ApplicationData == null || ApplicationDataFile == null)
+         return;
+
+      await ApplicationDataFile.WriteTContentAsync(
+         ApplicationData,
+         new JsonNewtonsoftSerializer(),
+         cancellationToken
+      );
+   }
+
+   public async Task SaveDefault(CancellationToken cancellationToken) {
+      if (ApplicationDataFile == null)
+         return;
+
+      await ApplicationDataFile.WriteTContentAsync(
+         ApplicationData.Default(),
+         CurrentSerializer,
+         cancellationToken
+      );
+   }
+
+   public async Task<Option> Load(CancellationToken cancellationToken) {
+      if (ApplicationDataFile == null)
+         return Option.Fail();
+
+      var result = await ApplicationDataFile.ReadTContentAsync<ApplicationData>(
+         CurrentSerializer,
+         cancellationToken
+      );
+
+      if (result.Out(out var localConfig)) {
+         ApplicationData = localConfig;
+         return Option.Ok();
+      }
+
+      return Option.Fail();
+      ;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Drive/DriveService.cs
+// ============================================================================
+
+using PupaLib.Core;
+using PupaLib.FileIO;
+
+namespace FlashBrowser.Services.Drive;
+
+public sealed class DriveService {
+   public DriveInfo? UsableDrive { get; set; }
+
+   public Option<VirtualFolder> FindFolderFromUsableDrive(string folderName) {
+      var drive = UsableDrive!;
+      var driveFolderOption = VirtualFolder.GetFolder(drive.RootDirectory.FullName);
+      if (driveFolderOption.Out(out var driveFolder))
+         foreach (var folder in driveFolder.EnumerateFolders(SearchOption.TopDirectoryOnly))
+            if (folder.Exists && folder.Name == folderName)
+               return Option<VirtualFolder>.Ok(folder);
+
+      return Option<VirtualFolder>.Fail();
+   }
+
+   public IEnumerable<DriveInfo> GetDrives() {
+      return DriveInfo.GetDrives();
+   }
+
+   public IEnumerable<DriveInfo> GetActiveDrives() {
+      return DriveInfo.GetDrives().Where(x => x.IsReady);
+   }
+
+   public IEnumerable<DriveInfo> GetActiveEjectableDrives() {
+      return DriveInfo.GetDrives().Where(x => x.IsReady && x.DriveType == DriveType.Removable);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Input/Binds/AppBinds.cs
+// ============================================================================
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Services.Input.Binds;
+
+public sealed class AppBinds(IAppLifetimeManager appLifetimeManager) : IBindPressed {
+   public Eventer Saved { get; } = new();
+   public Eventer Undo { get; } = new();
+   public Eventer Rendo { get; } = new();
+
+   public void OnCancel() {
+      appLifetimeManager.Cancel();
+   }
+
+   public void OnCtrlZ() {
+      Undo.Invoke(this);
+   }
+
+   public void OnSave() {
+      Saved.Invoke(this);
+   }
+
+   public void OnCtrlY() {
+      Rendo.Invoke(this);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Input/Binds/IBindPressed.cs
+// ============================================================================
+
+namespace FlashBrowser.Services.Input.Binds;
+
+public interface IBindPressed {
+   public void OnCancel();
+   public void OnCtrlZ();
+}
+
+
+// ============================================================================
+// Source file: src/Services/Input/ConsoleInputService.cs
+// ============================================================================
+
+using FlashBrowser.Services.Input.Binds;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.Services.Input;
+
+public sealed class ConsoleInputService(IBindPressed bindPressed) : IKeyboardInputService {
+   private readonly Eventer<ConsoleKeyInfo> _keyPressed = new();
+
+   public Task Init(CancellationToken cancellationToken) {
+      Console.CancelKeyPress += (_, _) => { bindPressed.OnCancel(); };
+      _ = Task.Run(() => {
+         while (cancellationToken.IsCancellationRequested == false) {
+            var key = Console.ReadKey(true);
+            _keyPressed.Invoke(this, key);
+            if ((key.Modifiers & ConsoleModifiers.Control) != 0 && key.Key == ConsoleKey.Z) bindPressed.OnCtrlZ();
+         }
+      }, cancellationToken);
+      return Task.CompletedTask;
+   }
+
+   public async Task<KeyboardKey> GetKeyboardKey() {
+      var result = await GetConsoleKey();
+      return KeyboardKey.FromConsole(result);
+   }
+
+   public async Task<ConsoleKeyInfo> GetConsoleKey() {
+      var tcs = new TaskCompletionSource<ConsoleKeyInfo>();
+      var handler = _keyPressed.Subscribe((sender, info) => { tcs.SetResult(info); });
+      var result = await tcs.Task;
+      _keyPressed.Unsubscribe(handler);
+      return result;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/Input/IKeyboardInputService.cs
+// ============================================================================
+
+namespace FlashBrowser.Services.Input;
+
+public interface IKeyboardInputService : IAnyService {
+   public Task<KeyboardKey> GetKeyboardKey();
+}
+
+
+// ============================================================================
+// Source file: src/Services/Input/KeyboardKey.cs
+// ============================================================================
+
+namespace FlashBrowser.Services.Input;
+
+public readonly struct KeyboardKey {
+   private KeyboardKey(int keyCode, byte modCode, char symbol) {
+      KeyCode = keyCode;
+      ModCode = modCode;
+      Symbol = symbol;
+   }
+
+   public static KeyboardKey FromConsole(in ConsoleKeyInfo info) {
+      return new KeyboardKey((int)info.Key, (byte)info.Modifiers, info.KeyChar);
+   }
+
+   public static KeyboardKey FromConsole(ConsoleKey key) {
+      return new KeyboardKey((int)key, (byte)ConsoleModifiers.None, '\0');
+   }
+
+
+   public bool IsEnter() {
+      return KeyCode == 13;
+   }
+
+   public bool IsBackspace() {
+      return KeyCode == 8;
+   }
+
+   public bool IsEsc() {
+      return KeyCode == 27;
+   }
+
+   public int KeyCode { get; }
+
+   public byte ModCode { get; }
+
+   public char Symbol { get; }
+}
+
+
+// ============================================================================
+// Source file: src/Services/OperationSystem/OperatingSystemService.cs
+// ============================================================================
+
+using System.Collections;
+
+namespace FlashBrowser.Services.OperationSystem;
+
+public sealed class OperatingSystemService : IEnumerable<OperatingSystemType> {
+   public OperatingSystemType CurrentOperatingSystem { get; private set; }
+
+   public IEnumerator<OperatingSystemType> GetEnumerator() {
+      return ((IEnumerable<OperatingSystemType>)Enum.GetValues<OperatingSystemType>()
+         .Where(x => x != OperatingSystemType.None)).GetEnumerator();
+   }
+
+   IEnumerator IEnumerable.GetEnumerator() {
+      return GetEnumerator();
+   }
+
+   public static bool IsOperationSystem(OperatingSystemType operatingSystemType) {
+      return operatingSystemType switch {
+         OperatingSystemType.Windows => OperatingSystem.IsWindows(),
+         OperatingSystemType.Linux => OperatingSystem.IsLinux(),
+         OperatingSystemType.MacOs => OperatingSystem.IsMacOS(),
+         _ => false
+      };
+   }
+
+   public void DetectCurrentOperatingSystem() {
+      CurrentOperatingSystem = GetCurrentOperatingSystemType();
+   }
+
+   public OperatingSystemType GetCurrentOperatingSystemType() {
+      foreach (var osType in this)
+         if (IsOperationSystem(osType))
+            return osType;
+      return OperatingSystemType.None;
+   }
+
+   public OperatingSystemType Cast(int value) {
+      return (OperatingSystemType)value;
+   }
+
+   public int Cast(OperatingSystemType value) {
+      return (int)value;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Services/OperationSystem/OperatingSystemType.cs
+// ============================================================================
+
+namespace FlashBrowser.Services.OperationSystem;
+
+public enum OperatingSystemType : byte {
+   Windows = 0,
+   Linux = 1,
+   MacOs = 2,
+   None = byte.MaxValue
+}
+
+
+// ============================================================================
+// Source file: src/UI/Builders/IUiBuilder.cs
+// ============================================================================
+
+using FlashBrowser.UI.Chains;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Builders;
+
+public interface IUiBuilder {
+   public IUiBuilder WithChain(Action<IUiBuilderChain> chainBuilder);
+   public Task<Option> Run(CancellationToken cancellationToken);
+   public Task<Option> RunAndClear(CancellationToken cancellationToken);
+   public IUiBuilder Clear();
+}
+
+
+// ============================================================================
+// Source file: src/UI/Builders/UiBuilder.cs
+// ============================================================================
+
+using FlashBrowser.Services.Input;
+using FlashBrowser.UI.Chains;
+using FlashBrowser.UI.Engines;
+
+using Microsoft.Extensions.DependencyInjection;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Builders;
+
+public sealed class UiBuilder : IUiBuilder {
+   private readonly Queue<IUiBuilderChain> _chains;
+   private readonly ServiceProvider _serviceProvider;
+
+   public UiBuilder(IUiEngine engine, IKeyboardInputService keyboardInputService) {
+      _chains = [];
+      KeyboardInputService = keyboardInputService;
+      ServiceCollection serviceCollection = [];
+      serviceCollection
+         .AddSingleton<IKeyboardInputService>(x => keyboardInputService)
+         .AddSingleton<IUiEngine>(x => engine);
+      _serviceProvider = serviceCollection.BuildServiceProvider();
+   }
+
+   public IKeyboardInputService KeyboardInputService { get; }
+
+   public IUiBuilder WithChain(Action<IUiBuilderChain> chainBuilder) {
+      var chain = new UiBuilderChain(_serviceProvider);
+      chainBuilder.Invoke(chain);
+      _chains.Enqueue(chain);
+      return this;
+   }
+
+   public async Task<Option> Run(CancellationToken cancellationToken) {
+      while (_chains.Count > 0) {
+         var chain = _chains.Dequeue();
+         var result = await chain.Run(cancellationToken);
+         if (result.Success)
+            continue;
+         return Option.Fail();
+      }
+
+      return Option.Ok();
+   }
+
+   public async Task<Option> RunAndClear(CancellationToken cancellationToken) {
+      var result = await Run(cancellationToken);
+      Clear();
+      return result;
+   }
+
+   public IUiBuilder Clear() {
+      _chains.Clear();
+      return this;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Chains/IUiBuilderChain.cs
+// ============================================================================
+
+using FlashBrowser.UI.Elements;
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Styles;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Chains;
+
+public interface IUiBuilderChain {
+   public IUiBuilderChain WithMessage(Action<IUiMessage> uiBuilder, UiStyle<IUiMessage>? style = null);
+   public IUiBuilderChain WithInput<T>(Action<IUiInput<T>> uiBuilder, UiStyle<IUiInput<T>>? style = null);
+   public IUiBuilderChain WithVerify(Action<IUiVerify> uiBuilder, UiStyle<IUiVerify>? style = null);
+   public IUiBuilderChain WithChoice(Action<IUiChoice> uiBuilder, UiStyle<IUiChoice>? style = null);
+   public IUiBuilderChain WithCustom<T>(Action<T> uiBuilder, UiStyle<T>? style = null) where T : IUiElement;
+   public Task<Option> Run(CancellationToken cancellationToken = default);
+}
+
+
+// ============================================================================
+// Source file: src/UI/Chains/UiBuilderChain.cs
+// ============================================================================
+
+using FlashBrowser.UI.Elements;
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Engines;
+using FlashBrowser.UI.Styles;
+
+using Microsoft.Extensions.DependencyInjection;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Chains;
+
+public sealed class UiBuilderChain : IUiBuilderChain {
+   private readonly Queue<IUiElement> _elements;
+   private readonly ServiceProvider _serviceProvider;
+
+   public UiBuilderChain(ServiceProvider serviceProvider) {
+      _elements = [];
+      _serviceProvider = serviceProvider;
+   }
+
+   private IUiEngine Engine => _serviceProvider.GetRequiredService<IUiEngine>();
+
+   public IUiBuilderChain WithMessage(Action<IUiMessage> uiBuilder, UiStyle<IUiMessage>? style) {
+      var uiElement = Engine.CreateMessage(_serviceProvider);
+      style?.Apply(uiElement);
+      uiBuilder.Invoke(uiElement);
+      _elements.Enqueue(uiElement);
+      return this;
+   }
+
+   public IUiBuilderChain WithChoice(Action<IUiChoice> uiBuilder, UiStyle<IUiChoice>? style) {
+      var uiElement = Engine.CreateChoice(_serviceProvider);
+      style?.Apply(uiElement);
+      uiBuilder.Invoke(uiElement);
+      _elements.Enqueue(uiElement);
+      return this;
+   }
+
+   public IUiBuilderChain WithVerify(Action<IUiVerify> uiBuilder, UiStyle<IUiVerify>? style) {
+      var uiElement = Engine.CreateVerify(_serviceProvider);
+      style?.Apply(uiElement);
+      uiBuilder.Invoke(uiElement);
+      _elements.Enqueue(uiElement);
+      return this;
+   }
+
+   public IUiBuilderChain WithInput<T>(Action<IUiInput<T>> uiBuilder, UiStyle<IUiInput<T>>? style) {
+      var uiElement = Engine.CreateInput<T>(_serviceProvider);
+      style?.Apply(uiElement);
+      uiBuilder.Invoke(uiElement);
+      _elements.Enqueue(uiElement);
+      return this;
+   }
+
+   public IUiBuilderChain WithCustom<T>(Action<T> uiBuilder, UiStyle<T>? style) where T : IUiElement {
+      var uiElement = ActivatorUtilities.CreateInstance<T>(_serviceProvider);
+      style?.Apply(uiElement);
+      uiBuilder.Invoke(uiElement);
+      _elements.Enqueue(uiElement);
+      return this;
+   }
+
+   public async Task<Option> Run(CancellationToken cancellationToken = default) {
+      while (_elements.Count > 0) {
+         var el = _elements.Dequeue();
+         var result = await el.Run(cancellationToken);
+         if (result.Success)
+            continue;
+         return Option.Fail();
+      }
+
+      return Option.Ok();
+   }
+}
+
+// public class Terminal : IUiEngine, IAnyService
+// {
+//     private readonly IKeyboardInputService _inputService;
+//     public Terminal(IKeyboardInputService inputService)
+//     {
+//         _inputService = inputService;
+//     }
+//
+//     public async Task<Option<(int index, string section)>> Choice(string[] sections, string prompt = "prompt", CancellationToken cancellationToken = default)
+//     {
+//         var index = 0;
+//         Console.Write($"<< {prompt} >>\n");
+//         var startCursor = Console.GetCursorPosition();
+//         while (cancellationToken.IsCancellationRequested == false)
+//         {
+//             Console.SetCursorPosition(startCursor.Left, startCursor.Top);
+//             for (int i = 0; i < sections.Length; i++)
+//             {
+//                 var item = sections[i];
+//                 if (i == index)
+//                 {
+//                     Console.Write($"-> {item}\n");
+//                     continue;
+//                 }
+//                 Console.Write($"   {item}\n");
+//             }
+//             var key = await _inputService.GetKeyboardKey();
+//             if (key.KeyCode == 38 || key.KeyCode == 87) // ArrowUp 38, W 87 
+//             {
+//                 index = MyMath.Repeat(index - 1, 0, sections.Length - 1);
+//                 continue;
+//             }
+//             if (key.KeyCode == 40 || key.KeyCode == 83) // ArrowDown 40, S 83
+//             {
+//                 index = MyMath.Repeat(index + 1, 0, sections.Length - 1);
+//                 continue;
+//             }
+//             if (key.IsEnter()) // Enter
+//             {
+//                 return Option<(int, string)>.Ok((index, sections[index]));
+//             }
+//             if (key.IsEsc() || key.IsBackspace()) // Escape
+//             {
+//                 return Option<(int, string)>.Ok((-1, string.Empty));
+//             }
+//         }
+//
+//         return Option<(int, string)>.Fail();
+//     }
+//
+//     public void Dialogue(string text, string author)
+//     {
+//         Console.Out.WriteLine($"<{author}> {text}");
+//     }
+//
+//     public void Message(string text)
+//     {
+//         Console.Out.Write(text);
+//     }
+//
+//     public async Task<Option> Verify(string warnText, CancellationToken cancellationToken = default)
+//     {
+//         Console.Out.Write($"[< {warnText} >] y/n");
+//         while (cancellationToken.IsCancellationRequested == false)
+//         {
+//             var key = await _inputService.GetKeyboardKey();
+//             if (key.KeyCode == 89) // Y 89 
+//             {
+//                 Console.Out.Write('\n');
+//                 return Option.Ok();
+//             }
+//             if (key.KeyCode == 78) // N 78
+//             {
+//                 Console.Out.Write('\n');
+//                 return Option.Fail();   
+//             }
+//         }
+//         Console.Out.Write('\n');
+//         return Option.Fail();
+//     }
+//
+//     public async Task<Option<T>> Input<T>(string prompt = "prompt", CancellationToken cancellationToken = default)
+//     {
+//         var sb = new StringBuilder();
+//         Console.Write($"[{prompt}] > ");
+//         while (cancellationToken.IsCancellationRequested == false)
+//         {
+//             var cursor = Console.GetCursorPosition();
+//             var keyboardKey = await _inputService.GetKeyboardKey();
+//             if (keyboardKey.IsEnter()) //Enter
+//             {
+//                 try
+//                 {
+//                     var value = (T)Convert.ChangeType(sb.ToString(), typeof(T));
+//                     Console.Write('\n');
+//                     return Option<T>.Ok(value);
+//                 }
+//                 catch (FormatException)
+//                 {
+//                     continue;
+//                 }        
+//                 catch(InvalidCastException)
+//                 {
+//                     continue;
+//                 }
+//             }
+//             if (keyboardKey.IsEsc()) //Escape
+//             {
+//                 break;
+//             }
+//             if(keyboardKey.IsBackspace()) //Backspace
+//             {
+//                 if (sb.Length < 1)
+//                     continue;
+//                 sb.Remove(sb.Length - 1, 1);
+//                 Console.SetCursorPosition(cursor.Left - 1, cursor.Top);
+//                 Console.Write(' ');
+//                 Console.SetCursorPosition(cursor.Left - 1, cursor.Top);
+//                 continue;
+//             }
+//             sb.Append(keyboardKey.Symbol);
+//             Console.Write(keyboardKey.Symbol);
+//         }
+//         return Option<T>.Fail();
+//     }
+//
+//     public Task Init(CancellationToken cancellationToken)
+//     {
+//         Console.Clear();
+//         return Task.CompletedTask;
+//     }
+// }
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Base/IUiChoice.cs
+// ============================================================================
+
+using FlashBrowser.UI.Values;
+using FlashBrowser.Utils;
+
+namespace FlashBrowser.UI.Elements.Base;
+
+public interface IUiChoice : IUiElement, IUiSetter<IUiChoice, (int index, string choice)> {
+   public IUiChoice WithPrompt(IValue<string> value);
+
+   public IUiChoice WithPrompt(string value) {
+      return WithPrompt(new ConstValue<string>(value));
+   }
+
+   public IUiChoice WithChoice(IValue<string> value);
+
+   public IUiChoice WithChoice(string value) {
+      return WithChoice(new ConstValue<string>(value));
+   }
+
+   public IUiChoice WithChoices(params IValue<string>[] value);
+
+   public IUiChoice WithSelectFgColor(Color color) {
+      return WithSelectFgColor(new ConstValue<Color>(color));
+   }
+
+   public IUiChoice WithSelectBgColor(Color color) {
+      return WithSelectBgColor(new ConstValue<Color>(color));
+   }
+
+   public IUiChoice WithNoSelectFgColor(Color color) {
+      return WithNoSelectFgColor(new ConstValue<Color>(color));
+   }
+
+   public IUiChoice WithNoSelectBgColor(Color color) {
+      return WithNoSelectBgColor(new ConstValue<Color>(color));
+   }
+
+   public IUiChoice WithSelectFgColor(IValue<Color> color);
+   public IUiChoice WithSelectBgColor(IValue<Color> color);
+   public IUiChoice WithNoSelectFgColor(IValue<Color> color);
+   public IUiChoice WithNoSelectBgColor(IValue<Color> color);
+
+   public IUiChoice WithChoices(params string[] value) {
+      return value.Length <= 0
+         ? this
+         : WithChoices(value.Select(x => new ConstValue<string>(x)).ToArray<IValue<string>>());
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Base/IUiInput.cs
+// ============================================================================
+
+using FlashBrowser.UI.Values;
+
+namespace FlashBrowser.UI.Elements.Base;
+
+public interface IUiInput<T> : IUiElement {
+   public IUiInput<T> WithPrompt(IValue<string> value);
+
+   public IUiInput<T> WithPrompt(string prompt) {
+      return WithPrompt(new ConstValue<string>(prompt));
+   }
+
+   public IUiInput<T> WithRange(IValue<(int min, int max)> value);
+   public IUiInput<T> WithSecret(IValue<char> value);
+
+   public IUiInput<T> WithSecret(char value) {
+      return WithSecret(new ConstValue<char>(value));
+   }
+
+   public IUiInput<T> WithRange(int min = 0, int max = int.MaxValue) {
+      return WithRange(new ConstValue<(int min, int max)>((min, max)));
+   }
+
+   public IUiInput<T> WithCustomCondition(Func<T, bool> conditionCallback);
+   public IUiInput<T> Ref(in ValueRef<T> valueRef);
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Base/IUiMessage.cs
+// ============================================================================
+
+using FlashBrowser.UI.Values;
+using FlashBrowser.Utils;
+
+namespace FlashBrowser.UI.Elements.Base;
+
+public interface IUiMessage : IUiElement {
+   public IUiMessage WithText(IValue<string> value);
+   public IUiMessage WithAuthor(IValue<string> value);
+   public IUiMessage WithColorFg(IValue<Color> value);
+   public IUiMessage WithColorBg(IValue<Color> value);
+
+   public IUiMessage WithColorFg(Color value) {
+      return WithColorFg(new ConstValue<Color>(value));
+   }
+
+   public IUiMessage WithColorBg(Color value) {
+      return WithColorBg(new ConstValue<Color>(value));
+   }
+
+   public IUiMessage WithText(string value) {
+      return WithText(new ConstValue<string>(value));
+   }
+
+   public IUiMessage WithAuthor(string value) {
+      return WithAuthor(new ConstValue<string>(value));
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Base/IUiVerify.cs
+// ============================================================================
+
+using FlashBrowser.Services.Input;
+using FlashBrowser.UI.Values;
+
+namespace FlashBrowser.UI.Elements.Base;
+
+public interface IUiVerify : IUiElement, IUiSetter<IUiVerify, bool> {
+   public IUiVerify WithY(IValue<string> value);
+   public IUiVerify WithN(IValue<string> value);
+   public IUiVerify WithYKey(IValue<KeyboardKey> key);
+   public IUiVerify WithNKey(IValue<KeyboardKey> key);
+   public IUiVerify WithPrompt(IValue<string> value);
+
+   public IUiVerify WithPrompt(string value) {
+      return WithPrompt(new ConstValue<string>(value));
+   }
+
+   public IUiVerify WithY(string value) {
+      return WithY(new ConstValue<string>(value));
+   }
+
+   public IUiVerify WithN(string value) {
+      return WithN(new ConstValue<string>(value));
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/IUiElement.cs
+// ============================================================================
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Elements;
+
+public interface IUiElement {
+   public Task<Option> Run(CancellationToken cancellationToken);
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Terminal/UiTerminalChoice.cs
+// ============================================================================
+
+using System.Text;
+
+using FlashBrowser.Services.Input;
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Values;
+using FlashBrowser.Utils;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Elements.Terminal;
+
+public sealed class UiTerminalChoice(IKeyboardInputService keyboardInputService) : UiElement, IUiChoice {
+   private readonly List<IValue<string>> _itemsValues = [];
+   private readonly StringBuilder _sb = new();
+   private readonly string EmptyLine = new(' ', Console.WindowWidth);
+   private IValue<Color> _noSelectBg = new ConstValue<Color>(Color.Black);
+   private IValue<Color> _noSelectFg = new ConstValue<Color>(Color.White);
+   private IValue<string> _promptValue = new ConstValue<string>(string.Empty);
+   private IValue<Color> _selectBg = new ConstValue<Color>(Color.White);
+   private IValue<Color> _selectFg = new ConstValue<Color>(Color.Black);
+   private ValueRef<(int, string)>? _valueRef;
+
+   public override async Task<Option> Run(CancellationToken cancellationToken) {
+      while (cancellationToken.IsCancellationRequested == false) {
+         var result = await Invoke(cancellationToken);
+         Console.CursorVisible = true;
+         if (result.Success == false)
+            break;
+         _valueRef?.Set(result.Content);
+         return Option.Ok();
+      }
+
+      return Option.Fail();
+   }
+
+   public IUiChoice WithPrompt(IValue<string> value) {
+      _promptValue = value;
+      return this;
+   }
+
+   public IUiChoice WithChoice(IValue<string> value) {
+      _itemsValues.Add(value);
+      return this;
+   }
+
+   public IUiChoice WithChoices(params IValue<string>[] value) {
+      _itemsValues.AddRange(value);
+      return this;
+   }
+
+   public IUiChoice WithSelectFgColor(IValue<Color> color) {
+      _selectFg = color;
+      return this;
+   }
+
+   public IUiChoice WithSelectBgColor(IValue<Color> color) {
+      _selectBg = color;
+      return this;
+   }
+
+   public IUiChoice WithNoSelectFgColor(IValue<Color> color) {
+      _noSelectFg = color;
+      return this;
+   }
+
+   public IUiChoice WithNoSelectBgColor(IValue<Color> color) {
+      _noSelectBg = color;
+      return this;
+   }
+
+   public IUiChoice Ref(in ValueRef<(int index, string choice)> valueRef) {
+      _valueRef = valueRef;
+      return this;
+   }
+
+   private void ClearLines(int amount) {
+      for (var i = 0; i <= amount + 1; i++)
+         _sb.AppendLine(EmptyLine);
+      Console.Write(_sb.ToString());
+      _sb.Clear();
+   }
+
+   private async Task<Option<(int, string)>> Invoke(CancellationToken cancellationToken) {
+      var index = 0;
+      ClearLines(_itemsValues.Count);
+      Console.CursorVisible = false;
+      var startCursor = (left: 0, top: Console.CursorTop);
+      while (cancellationToken.IsCancellationRequested == false) {
+         Console.CursorTop = startCursor.top - _itemsValues.Count - 1;
+         _sb.AppendLine(Color.ColorizeFgBgX1B($"<< {_promptValue.Get()} >>", _noSelectFg.Get(), _noSelectBg.Get()));
+         for (var i = 0; i < _itemsValues.Count; i++) {
+            var item = _itemsValues[i];
+            var value = item.Get();
+            if (i == index) {
+               _sb.AppendLine(Color.ColorizeFgBgX1B($"-> {value}", _selectFg.Get(), _selectBg.Get()));
+               continue;
+            }
+
+            _sb.AppendLine(Color.ColorizeFgBgX1B($"   {value}", _noSelectFg.Get(), _noSelectBg.Get()));
+         }
+
+         Console.Write(_sb.ToString());
+         _sb.Clear();
+         //Console.SetCursorPosition(0, startCursor.top);
+         var key = await keyboardInputService.GetKeyboardKey();
+         if (IsKeyUp(key))
+            index = MyMath.Repeat(index - 1, 0, _itemsValues.Count - 1);
+         else if (IsKeyDown(key))
+            index = MyMath.Repeat(index + 1, 0, _itemsValues.Count - 1);
+         else if (key.IsEnter())
+            return Option<(int, string)>.Ok((index, _itemsValues[index].Get()));
+         else if (key.IsEsc() || key.IsBackspace()) return Option<(int, string)>.Ok((-1, string.Empty));
+      }
+
+      return Option<(int, string)>.Fail();
+   }
+
+   private static bool IsKeyUp(KeyboardKey key) {
+      return key.KeyCode is 38 or 87 or 33; // ArrowUp 38, W 87, PageUp 33;
+   }
+
+   private static bool IsKeyDown(KeyboardKey key) {
+      return key.KeyCode is 40 or 83 or 34; // ArrowDown 40, S 83, PageDown 34;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Terminal/UiTerminalInput.cs
+// ============================================================================
+
+using System.Text;
+
+using FlashBrowser.Services.Input;
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Elements.Terminal;
+
+public sealed class UiTerminalInput<T>(
+   IKeyboardInputService keyboardInputService) :
+   UiElement, IUiInput<T> {
+   private readonly List<Func<T, bool>> _conditionCallbacks = [];
+   private IValue<string> _promptValue = new ConstValue<string>(string.Empty);
+   private IValue<(int min, int max)> _rangeValue = new ConstValue<(int min, int max)>((0, int.MaxValue));
+   private IValue<char>? _secretSymbolValue;
+   private ValueRef<T>? _valueRef;
+
+   public override async Task<Option> Run(CancellationToken cancellationToken) {
+      while (cancellationToken.IsCancellationRequested == false) {
+         var resultOption = await Invoke(cancellationToken);
+         Console.CursorVisible = false;
+         if (resultOption.Out(out var result) == false) return Option.Fail();
+
+         if (_conditionCallbacks.Count == 0 || _conditionCallbacks.All(x => x.Invoke(result))) {
+            _valueRef?.Set(result);
+            return Option.Ok();
+         }
+      }
+
+      return Option.Ok();
+   }
+
+   public IUiInput<T> Ref(in ValueRef<T> valueRef) {
+      _valueRef = valueRef;
+      return this;
+   }
+
+   public IUiInput<T> WithPrompt(IValue<string> value) {
+      _promptValue = value;
+      return this;
+   }
+
+   public IUiInput<T> WithRange(IValue<(int min, int max)> value) {
+      if (value.Get().min < 0)
+         throw new Exception("Min < 0");
+      _rangeValue = value;
+      return this;
+   }
+
+   public IUiInput<T> WithSecret(IValue<char> value) {
+      _secretSymbolValue = value;
+      return this;
+   }
+
+   public IUiInput<T> WithCustomCondition(Func<T, bool> conditionCallback) {
+      _conditionCallbacks.Add(conditionCallback);
+      return this;
+   }
+
+   private async Task<Option<T>> Invoke(CancellationToken cancellationToken) {
+      var sb = new StringBuilder();
+      sb.Clear();
+      Console.CursorVisible = true;
+      Console.Write($"[{_promptValue.Get()}] > ");
+      while (cancellationToken.IsCancellationRequested == false) {
+         var cursor = Console.GetCursorPosition();
+         var keyboardKey = await keyboardInputService.GetKeyboardKey();
+         if (keyboardKey.IsEnter()) //Enter
+         {
+            if (sb.Length <= _rangeValue.Get().min)
+               continue;
+            try {
+               var result = (T)Convert.ChangeType(sb.ToString(), typeof(T));
+               Console.Write('\n');
+               return Option<T>.Ok(result);
+            } catch {
+               continue;
+            }
+         }
+
+         if (keyboardKey.IsEsc()) //Escape
+         {
+            Console.Write('\n');
+            break;
+         }
+
+         if (keyboardKey.IsBackspace()) //Backspace
+         {
+            if (sb.Length < 1)
+               continue;
+            sb.Remove(sb.Length - 1, 1);
+            Console.SetCursorPosition(cursor.Left - 1, cursor.Top);
+            Console.Write(' ');
+            Console.SetCursorPosition(cursor.Left - 1, cursor.Top);
+            continue;
+         }
+
+         if (sb.Length >= _rangeValue.Get().max) continue;
+         sb.Append(keyboardKey.Symbol);
+         if (_secretSymbolValue != null) {
+            Console.Write(_secretSymbolValue.Get());
+            continue;
+         }
+
+         Console.Write(keyboardKey.Symbol);
+      }
+
+      return Option<T>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Terminal/UiTerminalMessage.cs
+// ============================================================================
+
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Values;
+using FlashBrowser.Utils;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Elements.Terminal;
+
+public sealed class UiTerminalMessage : UiElement, IUiMessage {
+   private IValue<string> _authorValue = new ConstValue<string>(string.Empty);
+   private IValue<Color> _bgColorValue = new ConstValue<Color>(Color.Black);
+   private IValue<Color> _fgColorValue = new ConstValue<Color>(Color.White);
+   private IValue<string> _textValue = new ConstValue<string>(string.Empty);
+
+   public override Task<Option> Run(CancellationToken cancellationToken) {
+      var prefix = "";
+      if (string.IsNullOrWhiteSpace(_authorValue.Get()) == false) prefix = $"<{_authorValue.Get()}> ";
+      Console.Out.Write(
+         Color.ColorizeFgBgX1B($"{prefix}{_textValue.Get()}\n", _fgColorValue.Get(), _bgColorValue.Get()));
+      return Task.FromResult(Option.Ok());
+   }
+
+   public IUiMessage WithText(IValue<string> value) {
+      _textValue = value;
+      return this;
+   }
+
+   public IUiMessage WithAuthor(IValue<string> value) {
+      _authorValue = value;
+      return this;
+   }
+
+   public IUiMessage WithColorFg(IValue<Color> value) {
+      _fgColorValue = value;
+      return this;
+   }
+
+   public IUiMessage WithColorBg(IValue<Color> value) {
+      _bgColorValue = value;
+      return this;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/Terminal/UiTerminalVerify.cs
+// ============================================================================
+
+using FlashBrowser.Services.Input;
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Values;
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Elements.Terminal;
+
+public sealed class UiTerminalVerify(
+   IKeyboardInputService keyboardInputService) : UiElement, IUiVerify {
+   private IValue<KeyboardKey> _keyNValue = new ConstValue<KeyboardKey>(KeyboardKey.FromConsole(ConsoleKey.N));
+   private IValue<KeyboardKey> _keyYValue = new ConstValue<KeyboardKey>(KeyboardKey.FromConsole(ConsoleKey.Y));
+   private IValue<string> _nValue = new ConstValue<string>("n");
+   private IValue<string> _promptValue = new ConstValue<string>(string.Empty);
+   private ValueRef<bool>? _valueRef;
+   private IValue<string> _yValue = new ConstValue<string>("y");
+
+   public override async Task<Option> Run(CancellationToken cancellationToken) {
+      while (cancellationToken.IsCancellationRequested == false) {
+         var result = await Invoke(cancellationToken);
+         Console.CursorVisible = true;
+         if (result.Success) {
+            _valueRef?.Set(result.Content);
+            return Option.Ok();
+         }
+
+         break;
+      }
+
+      return Option.Fail();
+   }
+
+
+   public IUiVerify WithY(IValue<string> value) {
+      _yValue = value;
+      return this;
+   }
+
+   public IUiVerify WithN(IValue<string> value) {
+      _nValue = value;
+      return this;
+   }
+
+   public IUiVerify WithPrompt(IValue<string> value) {
+      _promptValue = value;
+      return this;
+   }
+
+   public IUiVerify WithYKey(IValue<KeyboardKey> key) {
+      _keyYValue = key;
+      return this;
+   }
+
+   public IUiVerify WithNKey(IValue<KeyboardKey> key) {
+      _keyNValue = key;
+      return this;
+   }
+
+   public IUiVerify Ref(in ValueRef<bool> valueRef) {
+      _valueRef = valueRef;
+      return this;
+   }
+
+   private async Task<Option<bool>> Invoke(CancellationToken cancellationToken) {
+      Console.Out.Write($"[< {_promptValue.Get()} >] {_yValue.Get()}/{_nValue.Get()}");
+      Console.Out.Write('\n');
+      while (cancellationToken.IsCancellationRequested == false) {
+         Console.CursorVisible = false;
+         var key = await keyboardInputService.GetKeyboardKey();
+         if (key.KeyCode == _keyYValue.Get().KeyCode) // Y 89 
+            return Option<bool>.Ok(true);
+         if (key.KeyCode == _keyNValue.Get().KeyCode) // N 78
+            return Option<bool>.Ok(false);
+      }
+
+      return Option<bool>.Fail();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Elements/UiElement.cs
+// ============================================================================
+
+using PupaLib.Core;
+
+namespace FlashBrowser.UI.Elements;
+
+public abstract class UiElement : IUiElement {
+   public abstract Task<Option> Run(CancellationToken cancellationToken);
+}
+
+// public class Terminal : IUiEngine, IAnyService
+// {
+//     private readonly IKeyboardInputService _inputService;
+//     public Terminal(IKeyboardInputService inputService)
+//     {
+//         _inputService = inputService;
+//     }
+//
+//     public async Task<Option<(int index, string section)>> Choice(string[] sections, string prompt = "prompt", CancellationToken cancellationToken = default)
+//     {
+//         var index = 0;
+//         Console.Write($"<< {prompt} >>\n");
+//         var startCursor = Console.GetCursorPosition();
+//         while (cancellationToken.IsCancellationRequested == false)
+//         {
+//             Console.SetCursorPosition(startCursor.Left, startCursor.Top);
+//             for (int i = 0; i < sections.Length; i++)
+//             {
+//                 var item = sections[i];
+//                 if (i == index)
+//                 {
+//                     Console.Write($"-> {item}\n");
+//                     continue;
+//                 }
+//                 Console.Write($"   {item}\n");
+//             }
+//             var key = await _inputService.GetKeyboardKey();
+//             if (key.KeyCode == 38 || key.KeyCode == 87) // ArrowUp 38, W 87 
+//             {
+//                 index = MyMath.Repeat(index - 1, 0, sections.Length - 1);
+//                 continue;
+//             }
+//             if (key.KeyCode == 40 || key.KeyCode == 83) // ArrowDown 40, S 83
+//             {
+//                 index = MyMath.Repeat(index + 1, 0, sections.Length - 1);
+//                 continue;
+//             }
+//             if (key.IsEnter()) // Enter
+//             {
+//                 return Option<(int, string)>.Ok((index, sections[index]));
+//             }
+//             if (key.IsEsc() || key.IsBackspace()) // Escape
+//             {
+//                 return Option<(int, string)>.Ok((-1, string.Empty));
+//             }
+//         }
+//
+//         return Option<(int, string)>.Fail();
+//     }
+//
+//     public void Dialogue(string text, string author)
+//     {
+//         Console.Out.WriteLine($"<{author}> {text}");
+//     }
+//
+//     public void Message(string text)
+//     {
+//         Console.Out.Write(text);
+//     }
+//
+//     public async Task<Option> Verify(string warnText, CancellationToken cancellationToken = default)
+//     {
+//         Console.Out.Write($"[< {warnText} >] y/n");
+//         while (cancellationToken.IsCancellationRequested == false)
+//         {
+//             var key = await _inputService.GetKeyboardKey();
+//             if (key.KeyCode == 89) // Y 89 
+//             {
+//                 Console.Out.Write('\n');
+//                 return Option.Ok();
+//             }
+//             if (key.KeyCode == 78) // N 78
+//             {
+//                 Console.Out.Write('\n');
+//                 return Option.Fail();   
+//             }
+//         }
+//         Console.Out.Write('\n');
+//         return Option.Fail();
+//     }
+//
+//     public async Task<Option<T>> Input<T>(string prompt = "prompt", CancellationToken cancellationToken = default)
+//     {
+//         var sb = new StringBuilder();
+//         Console.Write($"[{prompt}] > ");
+//         while (cancellationToken.IsCancellationRequested == false)
+//         {
+//             var cursor = Console.GetCursorPosition();
+//             var keyboardKey = await _inputService.GetKeyboardKey();
+//             if (keyboardKey.IsEnter()) //Enter
+//             {
+//                 try
+//                 {
+//                     var value = (T)Convert.ChangeType(sb.ToString(), typeof(T));
+//                     Console.Write('\n');
+//                     return Option<T>.Ok(value);
+//                 }
+//                 catch (FormatException)
+//                 {
+//                     continue;
+//                 }        
+//                 catch(InvalidCastException)
+//                 {
+//                     continue;
+//                 }
+//             }
+//             if (keyboardKey.IsEsc()) //Escape
+//             {
+//                 break;
+//             }
+//             if(keyboardKey.IsBackspace()) //Backspace
+//             {
+//                 if (sb.Length < 1)
+//                     continue;
+//                 sb.Remove(sb.Length - 1, 1);
+//                 Console.SetCursorPosition(cursor.Left - 1, cursor.Top);
+//                 Console.Write(' ');
+//                 Console.SetCursorPosition(cursor.Left - 1, cursor.Top);
+//                 continue;
+//             }
+//             sb.Append(keyboardKey.Symbol);
+//             Console.Write(keyboardKey.Symbol);
+//         }
+//         return Option<T>.Fail();
+//     }
+//
+//     public Task Init(CancellationToken cancellationToken)
+//     {
+//         Console.Clear();
+//         return Task.CompletedTask;
+//     }
+// }
+
+
+// ============================================================================
+// Source file: src/UI/Engines/IUiEngine.cs
+// ============================================================================
+
+using FlashBrowser.UI.Elements.Base;
+
+using Microsoft.Extensions.DependencyInjection;
+
+namespace FlashBrowser.UI.Engines;
+
+public interface IUiEngine {
+   public IUiMessage CreateMessage(ServiceProvider serviceProvider);
+   public IUiInput<T> CreateInput<T>(ServiceProvider serviceProvider);
+   public IUiVerify CreateVerify(ServiceProvider serviceProvider);
+   public IUiChoice CreateChoice(ServiceProvider serviceProvider);
+}
+
+
+// ============================================================================
+// Source file: src/UI/Engines/UiTerminalEngine.cs
+// ============================================================================
+
+using FlashBrowser.UI.Elements.Base;
+using FlashBrowser.UI.Elements.Terminal;
+
+using Microsoft.Extensions.DependencyInjection;
+
+namespace FlashBrowser.UI.Engines;
+
+public sealed class UiTerminalEngine : IUiEngine {
+   public IUiMessage CreateMessage(ServiceProvider serviceProvider) {
+      return ActivatorUtilities.CreateInstance<UiTerminalMessage>(serviceProvider);
+   }
+
+   public IUiInput<T> CreateInput<T>(ServiceProvider serviceProvider) {
+      return ActivatorUtilities.CreateInstance<UiTerminalInput<T>>(serviceProvider);
+   }
+
+   public IUiVerify CreateVerify(ServiceProvider serviceProvider) {
+      return ActivatorUtilities.CreateInstance<UiTerminalVerify>(serviceProvider);
+   }
+
+   public IUiChoice CreateChoice(ServiceProvider serviceProvider) {
+      return ActivatorUtilities.CreateInstance<UiTerminalChoice>(serviceProvider);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/IUiSetter.cs
+// ============================================================================
+
+using FlashBrowser.UI.Values;
+
+namespace FlashBrowser.UI;
+
+public interface IUiSetter<out TSelf, T> where TSelf : IUiSetter<TSelf, T> {
+   public TSelf Ref(in ValueRef<T> valueRef);
+}
+
+
+// ============================================================================
+// Source file: src/UI/Styles/StyleUiBuilderExtensions.cs
+// ============================================================================
+
+using FlashBrowser.UI.Builders;
+using FlashBrowser.UI.Values;
+
+namespace FlashBrowser.UI.Styles;
+
+public static class StyleUiBuilderExtensions {
+   public static async Task Message(
+      this IUiBuilder ui,
+      IValue<string> value,
+      CancellationToken cancellationToken = default) {
+      ui
+         .WithChain(chain => chain
+            .WithMessage(message => message
+               .WithText(value)));
+      await ui.RunAndClear(cancellationToken);
+   }
+
+   public static Task Message(
+      this IUiBuilder ui,
+      string value,
+      CancellationToken cancellationToken = default) {
+      return ui.Message(new ConstValue<string>(value), cancellationToken);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Styles/UiStyle.cs
+// ============================================================================
+
+using FlashBrowser.UI.Elements;
+
+namespace FlashBrowser.UI.Styles;
+
+public sealed class UiStyle<T>(Action<T> elementBuilder) where T : IUiElement {
+   public void Apply(T element) {
+      elementBuilder?.Invoke(element);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/ConcatValue.cs
+// ============================================================================
+
+using System.Text;
+
+namespace FlashBrowser.UI.Values;
+
+public sealed class ConcatValue(params IValue<object>[] values) : IValue<string> {
+   public string Get() {
+      var sb = new StringBuilder();
+      foreach (var f in values) sb.Append(f.Get());
+
+      return sb.ToString();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/ConstValue.cs
+// ============================================================================
+
+namespace FlashBrowser.UI.Values;
+
+public sealed class ConstValue<T>(T value) : IValue<T> {
+   public T Get() {
+      return value;
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/ConvertValue.cs
+// ============================================================================
+
+namespace FlashBrowser.UI.Values;
+
+public sealed class ConvertValue<F, T>(IValue<F> value, Func<F, T> convertFunc) : IValue<T> {
+   public T Get() {
+      return convertFunc.Invoke(value.Get());
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/FuncValue.cs
+// ============================================================================
+
+namespace FlashBrowser.UI.Values;
+
+public sealed class FuncValue<T>(Func<T> func) : IValue<T> {
+   public T Get() {
+      return func.Invoke();
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/IValue.cs
+// ============================================================================
+
+namespace FlashBrowser.UI.Values;
+
+public interface IValue<out T> {
+   public T Get();
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/ValueExtensions.cs
+// ============================================================================
+
+namespace FlashBrowser.UI.Values;
+
+public static class ValueExtensions {
+   public static IValue<T> Map<F, T>(this IValue<F> value, Func<F, T> convert) {
+      return new ConvertValue<F, T>(value, convert);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/UI/Values/ValueRef.cs
+// ============================================================================
+
+namespace FlashBrowser.UI.Values;
+
+public sealed class ValueRef<T> : IValue<T> {
+   private bool _isSet;
+   private T? _value;
+
+   public ValueRef(T value) {
+      Set(value);
+   }
+
+   public ValueRef() { }
+
+   public T Get() {
+      if (!_isSet)
+         throw new Exception("Value not set");
+      return _value!;
+   }
+
+   public void Set(T value) {
+      _value = value;
+      _isSet = true;
+   }
+
+   public override string ToString() {
+      return Get()?.ToString() ?? "";
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Utils/Color.cs
+// ============================================================================
+
+namespace FlashBrowser.Utils;
+
+public readonly struct Color {
+   public static Color White => FromRgb(255);
+   public static Color Black => FromRgb(0);
+
+
+   private Color(byte r, byte g, byte b) {
+      R = r;
+      G = g;
+      B = b;
+   }
+
+   public static Color FromRgb(byte r, byte g, byte b) {
+      return new Color(r, g, b);
+   }
+
+   public static Color FromRgb((byte, byte, byte) v) {
+      return new Color(v.Item1, v.Item2, v.Item3);
+   }
+
+   public static Color FromRgb(byte v) {
+      return new Color(v, v, v);
+   }
+
+   public string ColorizeFgX1B(string str) {
+      return $"\x1b[38;2;{R};{G};{B}m{str}\x1b[0m";
+   }
+
+   public string ColorizeBgX1B(string str) {
+      return $"\x1b[48;2;{R};{G};{B}m{str}\x1b[0m";
+   }
+
+   public static string ColorizeFgBgX1B(string str, Color fg, Color bg) {
+      return $"\x1b[38;2;{fg.R};{fg.G};{fg.B};48;2;{bg.R};{bg.G};{bg.B}m{str}\x1b[0m";
+   }
+
+   public byte R { get; }
+
+   public byte G { get; }
+
+   public byte B { get; }
+}
+
+
+// ============================================================================
+// Source file: src/Utils/Kernel32Dll.cs
+// ============================================================================
+
+using System.Runtime.InteropServices;
+
+namespace FlashBrowser.Utils;
+
+internal static class Kernel32Dll {
+   [DllImport("kernel32.dll", SetLastError = true)]
+   public static extern bool SetConsoleMode(IntPtr hConsoleHandle, int mode);
+
+   [DllImport("kernel32.dll", SetLastError = true)]
+   public static extern bool GetConsoleMode(IntPtr handle, out int mode);
+
+   [DllImport("kernel32.dll", SetLastError = true)]
+   public static extern IntPtr GetStdHandle(int handle);
+
+   public static void EnableANSIConsoleMode() {
+      var handle = GetStdHandle(-11);
+      GetConsoleMode(handle, out var mode);
+      SetConsoleMode(handle, mode | 0x4);
+   }
+}
+
+
+// ============================================================================
+// Source file: src/Utils/MyMath.cs
+// ============================================================================
+
+using System.Security.Cryptography;
+using System.Text;
+
+namespace FlashBrowser.Utils;
+
+internal static class MyMath {
+   public static int Repeat(int value, int min, int max) {
+      return value < min ? max : value > max ? min : value;
+   }
+
+   public static string HashSha256(string value) {
+      return Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(value)));
+   }
+}
+
