@@ -3,6 +3,10 @@
 ##
 ## Get latest from `dotnet new gitignore`
 
+# custom
+merge.sh
+merge_result.txt
+
 # dotenv files
 .env
 
