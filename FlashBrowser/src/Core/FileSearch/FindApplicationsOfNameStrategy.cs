@@ -15,7 +15,8 @@ public sealed class FindApplicationsOfNameStrategy(DefaultOsProgramFolderStrateg
       var dir = new DirectoryInfo(defaultApplicationsFolder.MyPath);
       var enumerateOption = new EnumerationOptions {
          MatchCasing = MatchCasing.CaseInsensitive,
-         IgnoreInaccessible = true
+         IgnoreInaccessible = true,
+         MaxRecursionDepth = 3
       };
 
       foreach (var file in dir.EnumerateFiles(name, enumerateOption))

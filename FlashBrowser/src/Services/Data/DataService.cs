@@ -10,7 +10,7 @@ public sealed class DataService {
    public ApplicationData? ApplicationData { get; set; }
    public VirtualFile? ApplicationDataFile { get; set; }
    public VirtualFolder? ApplicationDataFolder { get; set; }
-   public ISerializer CurrentSerializer { get; } = new JsonSystemSerializer();
+   public ISerializer CurrentSerializer { get; } = new JsonNewtonsoftSerializer();
 
    public async Task Save(CancellationToken cancellationToken) {
       if (ApplicationData == null || ApplicationDataFile == null)
@@ -18,7 +18,7 @@ public sealed class DataService {
 
       await ApplicationDataFile.WriteTContentAsync(
          ApplicationData,
-         new JsonNewtonsoftSerializer(),
+         CurrentSerializer,
          cancellationToken
       );
    }
@@ -42,13 +42,11 @@ public sealed class DataService {
          CurrentSerializer,
          cancellationToken
       );
-
       if (result.Out(out var localConfig)) {
          ApplicationData = localConfig;
          return Option.Ok();
       }
 
       return Option.Fail();
-      ;
    }
 }

@@ -18,7 +18,7 @@ public sealed class CloseAllBrowserTabsStrategy(IUiBuilder ui, BrowserService br
             .WithVerify(verify => verify
                .WithPrompt("Close all pages?")
                .Ref(acceptRef)));
-         if (await ui.RunAndClear(cancellationToken))
+         if (await ui.RunAndClear(cancellationToken) && acceptRef.Get())
             await browserService.CloseAllPages(p => { ui.Message($"Page '{p.Url}' closed", cancellationToken); });
          break;
       }

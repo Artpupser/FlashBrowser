@@ -14,7 +14,6 @@ public sealed class HelloStepStrategy(IUiBuilder ui) : IStartupStrategy {
    public async Task<Option> Execute(IPipelineContext context, CancellationToken cancellationToken) {
       var localConfig = context.DataService.ApplicationData!;
       var isNewPassword = localConfig.IsFirst;
-
       await ui.Message("""
                                __n__n__
                         .------`-\00/-'
@@ -53,14 +52,17 @@ public sealed class HelloStepStrategy(IUiBuilder ui) : IStartupStrategy {
              isNewPassword == false) {
          await ui.Message("Hello user, it's FlashBrowser app", cancellationToken);
          var passwordRef = new ValueRef<string>();
-         ui
-            .WithChain(chain => chain
+         ui.WithChain(chain => chain
                .WithInput<string>(input => input
                   .WithPrompt("Type a password")
                   .WithRange(8, 20)
                   .WithSecret('*')
                   .Ref(passwordRef)));
-         await ui.RunAndClear(cancellationToken);
+         
+         if (await ui.RunAndClear(cancellationToken) == false) {
+            continue;
+         }
+
          if (MyMath.HashSha256(passwordRef.Get()) != localConfig.Password) {
             attempts -= 1;
             if (attempts < 1) return Option.Fail();

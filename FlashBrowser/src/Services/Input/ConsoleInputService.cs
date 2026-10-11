@@ -8,13 +8,17 @@ public sealed class ConsoleInputService(IBindPressed bindPressed) : IKeyboardInp
    private readonly Eventer<ConsoleKeyInfo> _keyPressed = new();
 
    public Task Init(CancellationToken cancellationToken) {
-      Console.CancelKeyPress += (_, _) => { bindPressed.OnCancel(); };
+      Console.CancelKeyPress += (obj, args) => { 
+         bindPressed.OnCancel();
+         //args.Cancel = true;
+      };
       _ = Task.Run(() => {
          while (cancellationToken.IsCancellationRequested == false) {
             var key = Console.ReadKey(true);
             _keyPressed.Invoke(this, key);
             if ((key.Modifiers & ConsoleModifiers.Control) != 0 && key.Key == ConsoleKey.Z) bindPressed.OnCtrlZ();
          }
+         
       }, cancellationToken);
       return Task.CompletedTask;
    }
