@@ -2705,7 +2705,7 @@ public sealed class DataService {
    public ApplicationData? ApplicationData { get; set; }
    public VirtualFile? ApplicationDataFile { get; set; }
    public VirtualFolder? ApplicationDataFolder { get; set; }
-   public ISerializer CurrentSerializer { get; } = new YamlDotNetSerializer();
+   public ISerializer CurrentSerializer { get; } = new JsonSystemSerializer();
 
    public async Task Save(CancellationToken cancellationToken) {
       if (ApplicationData == null || ApplicationDataFile == null)
